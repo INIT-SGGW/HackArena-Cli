@@ -1,0 +1,1376 @@
+use crate::archive::{ensure_executable, extract_archive, recreate_dir};
+use crate::config::{
+    EditionConfig, Paths, ProjectConfig, ProjectInstalledBinary, ProjectInstalledBundle,
+    ProjectManifest, ensure_dir, is_project_dir, load_project_config, load_project_manifest,
+    project_meta_dir, save_project_config, save_project_manifest, validate_edition,
+};
+use crate::constants::{PROJECT_BACKEND_DIR, PROJECT_WRAPPERS_DIR};
+use crate::download::{download_to_cache, sha256_file_hex};
+use crate::error::HackArenaError;
+use crate::github_releases;
+use std::io::{self, IsTerminal, Write};
+use std::path::{Path, PathBuf};
+use tempfile::TempDir;
+
+/// Sets the active edition and ensures the per-edition config exists.
+pub async fn use_edition(_paths: &Paths, edition: &str) -> Result<(), HackArenaError> {
+    validate_edition(edition)?;
+
+    let cwd = std::env::current_dir().map_err(HackArenaError::Io)?;
+    ensure_dir(&project_meta_dir(&cwd))?;
+
+    let mut cfg = if is_project_dir(&cwd) {
+        load_project_config(&cwd)?
+    } else {
+        ProjectConfig {
+            edition: edition.to_string(),
+            wrapper_id: None,
+            backend_dir: PathBuf::from(PROJECT_BACKEND_DIR),
+        }
+    };
+
+    cfg.edition = edition.to_string();
+    save_project_config(&cwd, &cfg)?;
+
+    println!("Project edition set to `{edition}` (source: GitHub Releases).");
+    Ok(())
+}
+
+/// Installs missing components using the current directory as a project.
+pub async fn install(
+    paths: &Paths,
+    skip_wrapper: bool,
+    no_cache: bool,
+    prerelease: bool,
+) -> Result<(), HackArenaError> {
+    let cwd = std::env::current_dir().map_err(HackArenaError::Io)?;
+    if !is_project_dir(&cwd) {
+        println!("No `./.hackarena/project.json` found in {}.", cwd.display());
+        println!("Run `hackarena use <edition>` first.");
+        return Ok(());
+    }
+
+    let project = load_project_config(&cwd)?;
+    validate_edition(&project.edition)?;
+    let backend_dir = cwd.join(&project.backend_dir);
+    let mut manifest = load_project_manifest(&cwd)?;
+
+    let config = load_effective_config(paths, &project, no_cache, prerelease).await?;
+    let installed_wrappers = discover_installed_wrappers(&cwd);
+    let chosen_wrapper = choose_wrapper_id(&project, &config, &installed_wrappers)?;
+    let mut backend_installed_now = false;
+    let mut wrapper_installed_now = false;
+
+    install_auth_with_config(paths, &config).await?;
+    if config.backend.is_some() {
+        if backend_dir.exists() {
+            if backend_dir_needs_repair(&manifest, &project.backend_dir, &backend_dir)? {
+                println!(
+                    "Backend exists at {} but looks incomplete/untracked. Reinstalling.",
+                    backend_dir.display()
+                );
+                install_backend_to_dir(paths, &config, &backend_dir, true).await?;
+                backend_installed_now = true;
+            } else {
+                println!("Backend already exists at {}", backend_dir.display());
+            }
+        } else {
+            install_backend_to_dir(paths, &config, &backend_dir, false).await?;
+            backend_installed_now = true;
+        }
+    } else if github_releases::has_backend_repo(&project.edition) {
+        println!("Warning: backend release is not available yet on GitHub for this edition.");
+    }
+    if !skip_wrapper {
+        for wrapper_id in github_releases::wrapper_ids_for_edition(&project.edition) {
+            if config.wrapper(wrapper_id).is_none() {
+                println!("Warning: wrapper `{wrapper_id}` release is not available yet on GitHub.");
+            }
+        }
+        if let Some(wrapper_id) = chosen_wrapper.as_deref() {
+            let managed_wrapper_id = github_releases::wrapper_base_id(wrapper_id);
+            let wrapper_dir = cwd.join(PROJECT_WRAPPERS_DIR).join(wrapper_id);
+            if wrapper_dir.exists() {
+                if validate_wrapper_install_layout(wrapper_id, &wrapper_dir).is_ok() {
+                    println!(
+                        "Wrapper `{wrapper_id}` already exists at {}",
+                        wrapper_dir.display()
+                    );
+                } else if let Some(wrapper) = config.wrapper(managed_wrapper_id) {
+                    let preserve_existing_user = wrapper_dir.join("user").is_dir();
+                    println!(
+                        "Wrapper `{wrapper_id}` at {} has invalid layout. Reinstalling.",
+                        wrapper_dir.display()
+                    );
+                    install_wrapper_to_dir(
+                        paths,
+                        &project.edition,
+                        wrapper_id,
+                        managed_wrapper_id,
+                        &wrapper_dir,
+                        no_cache,
+                        prerelease,
+                        preserve_existing_user,
+                        None,
+                        &wrapper.filename,
+                        &wrapper.sha256,
+                    )
+                    .await?;
+                    wrapper_installed_now = true;
+                } else {
+                    println!(
+                        "Warning: wrapper `{wrapper_id}` exists at {} but no release is available yet on GitHub to repair it.",
+                        wrapper_dir.display()
+                    );
+                }
+            } else {
+                if let Some(wrapper) = config.wrapper(managed_wrapper_id) {
+                    install_wrapper_to_dir(
+                        paths,
+                        &project.edition,
+                        wrapper_id,
+                        managed_wrapper_id,
+                        &wrapper_dir,
+                        no_cache,
+                        prerelease,
+                        false,
+                        None,
+                        &wrapper.filename,
+                        &wrapper.sha256,
+                    )
+                    .await?;
+                    wrapper_installed_now = true;
+                }
+            }
+        }
+    }
+
+    manifest.auth = Some(ProjectInstalledBinary {
+        path: paths.bin_dir.join(&config.bin_name_auth),
+        sha256: sha256_file_hex(&paths.bin_dir.join(&config.bin_name_auth)).ok(),
+        installed_at_unix: Some(unix_time_seconds()),
+    });
+    if backend_installed_now {
+        manifest.backend = resolve_project_backend_manifest(&config).await?;
+    }
+    if wrapper_installed_now
+        && let Some(wrapper_id) = chosen_wrapper.as_deref()
+        && let Some(w) = config.wrapper(github_releases::wrapper_base_id(wrapper_id))
+    {
+        manifest.wrappers.insert(
+            wrapper_id.to_string(),
+            ProjectInstalledBundle {
+                url: w.filename.clone(),
+                install_dir: PathBuf::from(PROJECT_WRAPPERS_DIR).join(wrapper_id),
+                sha256: Some(w.sha256.clone()),
+                installed_at_unix: Some(unix_time_seconds()),
+                files: vec![],
+            },
+        );
+    }
+    save_project_manifest(&cwd, &manifest)?;
+
+    Ok(())
+}
+
+/// Updates installed components in the current project.
+pub async fn update(paths: &Paths, no_cache: bool, prerelease: bool) -> Result<(), HackArenaError> {
+    update_auth(paths, no_cache, prerelease).await?;
+    update_backend(paths, no_cache, prerelease).await?;
+    let cwd = std::env::current_dir().map_err(HackArenaError::Io)?;
+    let project = load_project_config(&cwd)?;
+    let manifest = load_project_manifest(&cwd).unwrap_or_default();
+    let wrapper_ids = manifest.wrappers.keys().cloned().collect::<Vec<_>>();
+    for wrapper_id in wrapper_ids {
+        if !github_releases::has_wrapper_repo(&project.edition, &wrapper_id) {
+            println!("Wrapper `{wrapper_id}`: skip update (not configured for this edition).");
+            continue;
+        }
+        update_wrapper(paths, &wrapper_id, no_cache, prerelease, None).await?;
+    }
+    Ok(())
+}
+
+/// Updates global ha-auth if needed (prints up-to-date message too).
+pub async fn update_auth(
+    paths: &Paths,
+    no_cache: bool,
+    prerelease: bool,
+) -> Result<(), HackArenaError> {
+    let cwd = std::env::current_dir().map_err(HackArenaError::Io)?;
+    if !is_project_dir(&cwd) {
+        return Err(HackArenaError::msg(
+            "No `./.hackarena/project.json` found. Run `hackarena install` first.",
+        ));
+    }
+
+    let project = load_project_config(&cwd)?;
+    validate_edition(&project.edition)?;
+    let config = load_effective_config(paths, &project, no_cache, prerelease).await?;
+
+    let auth_path = paths.bin_dir.join(&config.bin_name_auth);
+    let current_sha = sha256_file_hex(&auth_path).ok();
+    if let Some(current) = current_sha.as_deref() {
+        if current.eq_ignore_ascii_case(&config.auth_artifact.sha256) {
+            println!("ha-auth is already up to date.");
+            return Ok(());
+        }
+    }
+
+    // Re-install is safe: installer skips if file exists, so delete first when updating.
+    if auth_path.exists() {
+        tokio::fs::remove_file(&auth_path)
+            .await
+            .map_err(|e| HackArenaError::io_with_path(&auth_path, e))?;
+    }
+    install_auth_with_config(paths, &config).await?;
+    Ok(())
+}
+
+/// Updates the backend in the current project by downloading the latest configured backend.
+pub async fn update_backend(
+    paths: &Paths,
+    no_cache: bool,
+    prerelease: bool,
+) -> Result<(), HackArenaError> {
+    let cwd = std::env::current_dir().map_err(HackArenaError::Io)?;
+    if !is_project_dir(&cwd) {
+        return Err(HackArenaError::msg(
+            "No `./.hackarena/project.json` found. Run `hackarena install` first.",
+        ));
+    }
+
+    let project = load_project_config(&cwd)?;
+    validate_edition(&project.edition)?;
+    let mut config = load_effective_config(paths, &project, no_cache, prerelease).await?;
+    if config.backend.is_none() {
+        return Err(HackArenaError::msg(format!(
+            "No backend release is available yet for edition `{}`.",
+            project.edition
+        )));
+    }
+
+    let current_project_manifest = load_project_manifest(&cwd).unwrap_or_default();
+    // Compare against the backend pinned by the cached/latest GitHub release metadata.
+    if let (Some(current), Some(expected)) = (
+        current_project_manifest.backend.as_ref(),
+        resolve_project_backend_manifest(&config).await?,
+    ) {
+        let current_sha = current.sha256.as_deref();
+        let expected_sha = expected.sha256.as_deref();
+        if current_sha.is_some()
+            && expected_sha.is_some()
+            && current_sha == expected_sha
+            && current.url == expected.url
+        {
+            println!("Backend is already up to date.");
+            return Ok(());
+        }
+    }
+
+    let backend_dir = cwd.join(&project.backend_dir);
+    if let Err(err) = install_backend_to_dir(paths, &config, &backend_dir, true).await {
+        if matches!(err, HackArenaError::ChecksumMismatch { .. }) {
+            config = load_effective_config(paths, &project, true, prerelease).await?;
+            install_backend_to_dir(paths, &config, &backend_dir, true).await?;
+        } else {
+            return Err(err);
+        }
+    }
+
+    let mut manifest = load_project_manifest(&cwd)?;
+    manifest.backend = resolve_project_backend_manifest(&config).await?;
+    save_project_manifest(&cwd, &manifest)?;
+
+    Ok(())
+}
+
+/// Installs only ha-auth (global).
+pub async fn install_auth(
+    paths: &Paths,
+    no_cache: bool,
+    prerelease: bool,
+) -> Result<(), HackArenaError> {
+    let cwd = std::env::current_dir().map_err(HackArenaError::Io)?;
+    if !is_project_dir(&cwd) {
+        return Err(HackArenaError::msg(
+            "No project found. Run `hackarena use <edition>` in your project first.",
+        ));
+    }
+    let project = load_project_config(&cwd)?;
+    let config = load_effective_config(paths, &project, no_cache, prerelease).await?;
+    install_auth_with_config(paths, &config).await?;
+    print_path_hint(paths);
+    Ok(())
+}
+
+/// Installs only backend bundle into `./backend` (project-local).
+pub async fn install_backend(
+    paths: &Paths,
+    no_cache: bool,
+    prerelease: bool,
+) -> Result<(), HackArenaError> {
+    let cwd = std::env::current_dir().map_err(HackArenaError::Io)?;
+    let project = if is_project_dir(&cwd) {
+        load_project_config(&cwd)?
+    } else {
+        return Err(HackArenaError::msg(
+            "No project found. Run `hackarena use <edition>` first.",
+        ));
+    };
+
+    let config = load_effective_config(paths, &project, no_cache, prerelease).await?;
+    if config.backend.is_none() {
+        return Err(HackArenaError::msg(format!(
+            "No backend release is available yet for edition `{}`.",
+            project.edition
+        )));
+    }
+    let mut manifest = load_project_manifest(&cwd)?;
+    let backend_dir = cwd.join(&project.backend_dir);
+    if backend_dir.exists() {
+        if backend_dir_needs_repair(&manifest, &project.backend_dir, &backend_dir)? {
+            println!(
+                "Backend exists at {} but looks incomplete/untracked. Reinstalling.",
+                backend_dir.display()
+            );
+            install_backend_to_dir(paths, &config, &backend_dir, true).await?;
+            manifest.backend = resolve_project_backend_manifest(&config).await?;
+            save_project_manifest(&cwd, &manifest)?;
+            return Ok(());
+        }
+        println!("Backend already exists at {}", backend_dir.display());
+        return Ok(());
+    }
+    install_backend_to_dir(paths, &config, &backend_dir, false).await?;
+    manifest.backend = resolve_project_backend_manifest(&config).await?;
+    save_project_manifest(&cwd, &manifest)?;
+    Ok(())
+}
+
+/// Installs a wrapper by id into `./wrappers/<wrapper_id>` (project-local).
+pub async fn install_wrapper(
+    paths: &Paths,
+    wrapper_id: &str,
+    no_cache: bool,
+    prerelease: bool,
+    release_tag: Option<&str>,
+) -> Result<(), HackArenaError> {
+    let cwd = std::env::current_dir().map_err(HackArenaError::Io)?;
+    let project = if is_project_dir(&cwd) {
+        load_project_config(&cwd)?
+    } else {
+        return Err(HackArenaError::msg(
+            "No project found. Run `hackarena use <edition>` first.",
+        ));
+    };
+
+    let wrappers_root = cwd.join(PROJECT_WRAPPERS_DIR);
+    ensure_dir(&wrappers_root)?;
+    let managed_wrapper_id = github_releases::wrapper_base_id(wrapper_id).to_string();
+    let requested_is_base = wrapper_id == managed_wrapper_id;
+    let mut target_wrapper_id = wrapper_id.to_string();
+    if requested_is_base {
+        let base_dir = wrappers_root.join(&managed_wrapper_id);
+        if base_dir.exists()
+            && validate_wrapper_install_layout(&managed_wrapper_id, &base_dir).is_ok()
+        {
+            let next = next_wrapper_instance_id(&wrappers_root, &managed_wrapper_id);
+            if !confirm_install_new_wrapper_instance(&managed_wrapper_id, &next)? {
+                println!(
+                    "Skipped. To install explicitly later, run `hackarena install wrapper {next}`."
+                );
+                return Ok(());
+            }
+            target_wrapper_id = next;
+        }
+    }
+    let wrapper_dir = wrappers_root.join(&target_wrapper_id);
+    let config = load_effective_config(paths, &project, no_cache, prerelease).await?;
+    let (wrapper_url, wrapper_sha) = resolve_wrapper_target(
+        paths,
+        &project,
+        &config,
+        &managed_wrapper_id,
+        no_cache,
+        prerelease,
+        release_tag,
+    )
+    .await?;
+    let preserve_existing_user = if wrapper_dir.exists() {
+        if validate_wrapper_install_layout(&target_wrapper_id, &wrapper_dir).is_ok() {
+            println!(
+                "Wrapper `{}` already exists at {}.",
+                target_wrapper_id,
+                wrapper_dir.display()
+            );
+            return Ok(());
+        }
+        println!(
+            "Wrapper `{}` at {} has invalid layout. Reinstalling.",
+            target_wrapper_id,
+            wrapper_dir.display()
+        );
+        wrapper_dir.join("user").is_dir()
+    } else {
+        false
+    };
+
+    install_wrapper_to_dir(
+        paths,
+        &project.edition,
+        &target_wrapper_id,
+        &managed_wrapper_id,
+        &wrapper_dir,
+        no_cache,
+        prerelease,
+        preserve_existing_user,
+        release_tag,
+        &wrapper_url,
+        &wrapper_sha,
+    )
+    .await?;
+
+    let mut manifest = load_project_manifest(&cwd)?;
+    manifest.wrappers.insert(
+        target_wrapper_id.clone(),
+        ProjectInstalledBundle {
+            url: wrapper_url,
+            install_dir: PathBuf::from(PROJECT_WRAPPERS_DIR).join(&target_wrapper_id),
+            sha256: Some(wrapper_sha),
+            installed_at_unix: Some(unix_time_seconds()),
+            files: vec![],
+        },
+    );
+    save_project_manifest(&cwd, &manifest)?;
+    Ok(())
+}
+
+pub async fn update_wrapper(
+    paths: &Paths,
+    wrapper_id: &str,
+    no_cache: bool,
+    prerelease: bool,
+    release_tag: Option<&str>,
+) -> Result<(), HackArenaError> {
+    let cwd = std::env::current_dir().map_err(HackArenaError::Io)?;
+    if !is_project_dir(&cwd) {
+        return Err(HackArenaError::msg(
+            "No `./.hackarena/project.json` found. Run `hackarena install` first.",
+        ));
+    }
+    let project = load_project_config(&cwd)?;
+    validate_edition(&project.edition)?;
+
+    let wrapper_dir = cwd.join(PROJECT_WRAPPERS_DIR).join(wrapper_id);
+    if !wrapper_dir.exists() {
+        return Err(HackArenaError::msg(format!(
+            "Wrapper `{wrapper_id}` is not installed in {}. Run `hackarena install wrapper {wrapper_id}` first.",
+            wrapper_dir.display()
+        )));
+    }
+
+    let config = load_effective_config(paths, &project, no_cache, prerelease).await?;
+    let managed_wrapper_id = github_releases::wrapper_base_id(wrapper_id).to_string();
+    let (wrapper_url, wrapper_sha) = resolve_wrapper_target(
+        paths,
+        &project,
+        &config,
+        &managed_wrapper_id,
+        no_cache,
+        prerelease,
+        release_tag,
+    )
+    .await?;
+
+    let mut manifest = load_project_manifest(&cwd)?;
+    if let Some(current) = manifest.wrappers.get(wrapper_id) {
+        if current.sha256.as_deref() == Some(wrapper_sha.as_str()) && current.url == wrapper_url {
+            println!("Wrapper `{wrapper_id}` is already up to date.");
+            return Ok(());
+        }
+    }
+
+    install_wrapper_to_dir(
+        paths,
+        &project.edition,
+        wrapper_id,
+        &managed_wrapper_id,
+        &wrapper_dir,
+        no_cache,
+        prerelease,
+        true,
+        release_tag,
+        &wrapper_url,
+        &wrapper_sha,
+    )
+    .await?;
+
+    manifest.wrappers.insert(
+        wrapper_id.to_string(),
+        ProjectInstalledBundle {
+            url: wrapper_url,
+            install_dir: PathBuf::from(PROJECT_WRAPPERS_DIR).join(wrapper_id),
+            sha256: Some(wrapper_sha),
+            installed_at_unix: Some(unix_time_seconds()),
+            files: vec![],
+        },
+    );
+    save_project_manifest(&cwd, &manifest)?;
+    Ok(())
+}
+
+async fn resolve_wrapper_target(
+    paths: &Paths,
+    project: &ProjectConfig,
+    config: &EditionConfig,
+    managed_wrapper_id: &str,
+    no_cache: bool,
+    _prerelease: bool,
+    release_tag: Option<&str>,
+) -> Result<(String, String), HackArenaError> {
+    if let Some(tag) = release_tag {
+        if !github_releases::has_wrapper_repo(&project.edition, managed_wrapper_id) {
+            return Err(HackArenaError::UnknownWrapper(
+                managed_wrapper_id.to_string(),
+            ));
+        }
+        let Some(bundle) = github_releases::wrapper_from_release_tag(
+            paths,
+            &project.edition,
+            managed_wrapper_id,
+            tag,
+            no_cache,
+        )
+        .await?
+        else {
+            return Err(HackArenaError::msg(format!(
+                "Release tag `{tag}` for wrapper `{managed_wrapper_id}` was not found."
+            )));
+        };
+        let sha = bundle.sha256.clone().ok_or_else(|| {
+            HackArenaError::msg(format!(
+                "Wrapper `{managed_wrapper_id}` release `{tag}` is missing SHA256 metadata."
+            ))
+        })?;
+        return Ok((bundle.url, sha));
+    }
+
+    let Some(wrapper) = config.wrapper(managed_wrapper_id) else {
+        if github_releases::has_wrapper_repo(&project.edition, managed_wrapper_id) {
+            return Err(HackArenaError::msg(format!(
+                "No GitHub release for wrapper `{managed_wrapper_id}` yet."
+            )));
+        }
+        return Err(HackArenaError::UnknownWrapper(
+            managed_wrapper_id.to_string(),
+        ));
+    };
+    Ok((wrapper.filename.clone(), wrapper.sha256.clone()))
+}
+
+async fn install_auth_with_config(
+    paths: &Paths,
+    config: &EditionConfig,
+) -> Result<(), HackArenaError> {
+    ensure_dir(&paths.bin_dir)?;
+    ensure_dir(&paths.downloads_cache_dir())?;
+    ensure_dir(&paths.data_root())?;
+
+    let dest = paths.bin_dir.join(&config.bin_name_auth);
+    if dest.exists() {
+        println!(
+            "Global `{}` already exists at {}",
+            config.bin_name_auth,
+            dest.display()
+        );
+        return Ok(());
+    }
+
+    let url = config.auth_artifact.filename.clone();
+    let cache_filename = filename_from_url(&url).unwrap_or_else(|| config.bin_name_auth.clone());
+    let cached =
+        download_to_cache(paths, &url, &cache_filename, &config.auth_artifact.sha256).await?;
+
+    if is_archive_path(&cached) {
+        let tmp = extract_to_temp_dir(paths, &cached)?;
+        let extracted = find_extracted_file(tmp.path(), &config.bin_name_auth)?;
+        install_file_atomic(&extracted, &dest)?;
+    } else {
+        install_file_atomic(&cached, &dest)?;
+    }
+    ensure_executable(&dest)?;
+
+    println!("Installed `{}` to {}", config.bin_name_auth, dest.display());
+    Ok(())
+}
+
+async fn install_backend_to_dir(
+    paths: &Paths,
+    config: &EditionConfig,
+    install_dir: &Path,
+    force_replace: bool,
+) -> Result<(), HackArenaError> {
+    ensure_dir(&paths.downloads_cache_dir())?;
+    if let Some(parent) = install_dir.parent() {
+        ensure_dir(parent)?;
+    }
+
+    let Some((url, cache_filename, sha256)) = resolve_backend_download(config).await? else {
+        return Err(HackArenaError::msg(format!(
+            "Edition `{}` has no backend configured.",
+            config.edition
+        )));
+    };
+
+    if install_dir.exists() && !force_replace {
+        return Err(HackArenaError::msg(format!(
+            "Backend directory already exists at {}",
+            install_dir.display()
+        )));
+    }
+
+    let cached = download_to_cache(paths, &url, &cache_filename, &sha256).await?;
+    recreate_dir(install_dir)?;
+    extract_archive(&cached, install_dir)?;
+    if force_replace {
+        println!("Updated backend at {}", install_dir.display());
+    } else {
+        println!("Installed backend to {}", install_dir.display());
+    }
+    Ok(())
+}
+
+async fn install_wrapper_to_dir(
+    paths: &Paths,
+    edition: &str,
+    wrapper_instance_id: &str,
+    managed_wrapper_id: &str,
+    install_dir: &Path,
+    no_cache: bool,
+    prerelease: bool,
+    preserve_existing_user: bool,
+    release_tag: Option<&str>,
+    wrapper_url: &str,
+    wrapper_sha: &str,
+) -> Result<(), HackArenaError> {
+    ensure_dir(&paths.downloads_cache_dir())?;
+    if let Some(parent) = install_dir.parent() {
+        ensure_dir(parent)?;
+    }
+
+    let cache_filename =
+        filename_from_url(wrapper_url).unwrap_or_else(|| "wrapper.zip".to_string());
+    let cached = download_to_cache(paths, wrapper_url, &cache_filename, wrapper_sha).await?;
+
+    deploy_wrapper_archive(
+        wrapper_instance_id,
+        &cached,
+        install_dir,
+        preserve_existing_user,
+    )?;
+    validate_wrapper_install_layout(wrapper_instance_id, install_dir)?;
+
+    if preserve_existing_user {
+        println!(
+            "Updated wrapper `{}` at {} (preserved `user/`).",
+            wrapper_instance_id,
+            install_dir.display()
+        );
+    } else {
+        println!(
+            "Installed wrapper `{}` to {}",
+            wrapper_instance_id,
+            install_dir.display()
+        );
+    }
+    if managed_wrapper_id.eq_ignore_ascii_case("python") {
+        ensure_python_wrapper_env_api_url(install_dir)?;
+    }
+    let wheel_artifact = if let Some(tag) = release_tag {
+        github_releases::wrapper_python_wheel_from_release_tag(
+            paths,
+            edition,
+            managed_wrapper_id,
+            tag,
+            no_cache,
+        )
+        .await?
+    } else {
+        github_releases::latest_wrapper_python_wheel_from_releases(
+            paths,
+            edition,
+            managed_wrapper_id,
+            no_cache,
+            prerelease,
+        )
+        .await?
+    };
+    if let Some(wheel_artifact) = wheel_artifact {
+        let wheel_url = wheel_artifact.filename;
+        let wheel_cache_filename = filename_from_url(&wheel_url)
+            .unwrap_or_else(|| "hackarena3-py3-none-any.whl".to_string());
+        let wheel_cached = download_to_cache(
+            paths,
+            &wheel_url,
+            &wheel_cache_filename,
+            &wheel_artifact.sha256,
+        )
+        .await?;
+        let vendored_req_path = vendor_python_wheel(install_dir, &wheel_cached)?;
+        ensure_python_requirements_has_wheel(install_dir, &vendored_req_path)?;
+        print_python_runtime_hint(&vendored_req_path);
+    }
+    Ok(())
+}
+
+fn deploy_wrapper_archive(
+    wrapper_id: &str,
+    archive_path: &Path,
+    install_dir: &Path,
+    preserve_existing_user: bool,
+) -> Result<(), HackArenaError> {
+    if !preserve_existing_user || !install_dir.exists() {
+        recreate_dir(install_dir)?;
+        extract_archive(archive_path, install_dir)?;
+        return Ok(());
+    }
+
+    // Validate new archive before touching existing install dir.
+    let validate_tmp = tempfile::tempdir().map_err(HackArenaError::Io)?;
+    extract_archive(archive_path, validate_tmp.path())?;
+    validate_wrapper_install_layout(wrapper_id, validate_tmp.path())?;
+
+    let existing_user = install_dir.join("user");
+    let user_backup_tmp = tempfile::tempdir().map_err(HackArenaError::Io)?;
+    let backup_user_dir = user_backup_tmp.path().join("user");
+    let has_user = existing_user.is_dir();
+    if has_user {
+        copy_dir_recursive(&existing_user, &backup_user_dir)?;
+    }
+
+    recreate_dir(install_dir)?;
+    extract_archive(archive_path, install_dir)?;
+
+    if has_user {
+        let target_user = install_dir.join("user");
+        if target_user.exists() {
+            std::fs::remove_dir_all(&target_user)
+                .map_err(|e| HackArenaError::io_with_path(&target_user, e))?;
+        }
+        copy_dir_recursive(&backup_user_dir, &target_user)?;
+    }
+
+    Ok(())
+}
+
+fn copy_dir_recursive(src: &Path, dst: &Path) -> Result<(), HackArenaError> {
+    ensure_dir(dst)?;
+    let rd = std::fs::read_dir(src).map_err(|e| HackArenaError::io_with_path(src, e))?;
+    for entry in rd {
+        let entry = entry.map_err(HackArenaError::Io)?;
+        let path = entry.path();
+        let ft = entry
+            .file_type()
+            .map_err(|e| HackArenaError::io_with_path(&path, e))?;
+        let target = dst.join(entry.file_name());
+        if ft.is_dir() {
+            copy_dir_recursive(&path, &target)?;
+            continue;
+        }
+        if ft.is_file() {
+            std::fs::copy(&path, &target).map_err(|e| HackArenaError::io_with_path(&target, e))?;
+        }
+    }
+    Ok(())
+}
+
+fn validate_wrapper_install_layout(
+    wrapper_id: &str,
+    install_dir: &Path,
+) -> Result<(), HackArenaError> {
+    let user_dir = install_dir.join("user");
+    if !user_dir.is_dir() {
+        return Err(HackArenaError::msg(format!(
+            "Wrapper `{wrapper_id}` has invalid layout: missing `user/` directory in {}.",
+            install_dir.display()
+        )));
+    }
+
+    let has_manifest = ["manifest.toml", "system/manifest.toml"]
+        .iter()
+        .any(|rel| install_dir.join(rel).is_file());
+    if !has_manifest {
+        return Err(HackArenaError::msg(format!(
+            "Wrapper `{wrapper_id}` has invalid layout: missing `manifest.toml` (root) or `system/manifest.toml` in {}.",
+            install_dir.display()
+        )));
+    }
+
+    Ok(())
+}
+
+fn print_python_runtime_hint(_vendored_req_path: &str) {
+    println!("Updated `user/requirements.txt` with Python runtime (`hackarena3`).");
+    println!("Required for local run/tests: install dependencies in your virtual environment.");
+    println!("Run from this wrapper directory:");
+    println!("  python -m pip install -r user/requirements.txt");
+}
+
+fn ensure_python_wrapper_env_api_url(install_dir: &Path) -> Result<(), HackArenaError> {
+    const ENV_VAR: &str = "HA3_WRAPPER_API_URL";
+    const DEFAULT_VALUE: &str = "ha3-api.hackarena.pl";
+
+    let env_path = install_dir.join("user").join(".env");
+    if let Some(parent) = env_path.parent() {
+        ensure_dir(parent)?;
+    }
+
+    let existing = if env_path.is_file() {
+        std::fs::read_to_string(&env_path)
+            .map_err(|e| HackArenaError::io_with_path(&env_path, e))?
+    } else {
+        String::new()
+    };
+    let mut lines: Vec<String> = existing.lines().map(|l| l.to_string()).collect();
+    if lines
+        .iter()
+        .any(|line| line.trim_start().starts_with(&format!("{ENV_VAR}=")))
+    {
+        return Ok(());
+    }
+    lines.push(format!("{ENV_VAR}={DEFAULT_VALUE}"));
+
+    let mut out = lines.join("\n");
+    if !out.is_empty() {
+        out.push('\n');
+    }
+    std::fs::write(&env_path, out).map_err(|e| HackArenaError::io_with_path(&env_path, e))?;
+    Ok(())
+}
+
+fn vendor_python_wheel(install_dir: &Path, cached_wheel: &Path) -> Result<String, HackArenaError> {
+    let wheel_name = cached_wheel
+        .file_name()
+        .and_then(|n| n.to_str())
+        .ok_or_else(|| HackArenaError::msg("invalid wheel filename"))?;
+    let vendor_dir = install_dir.join("user").join(".vendor");
+    ensure_dir(&vendor_dir)?;
+    let vendor_path = vendor_dir.join(wheel_name);
+    std::fs::copy(cached_wheel, &vendor_path)
+        .map_err(|e| HackArenaError::io_with_path(&vendor_path, e))?;
+    Ok(format!("./.vendor/{wheel_name}"))
+}
+
+fn is_hackarena3_requirement_line(line: &str) -> bool {
+    let trimmed = line.trim();
+    if trimmed.is_empty() {
+        return false;
+    }
+    let lower = trimmed.to_ascii_lowercase();
+    lower.starts_with("hackarena3==")
+        || lower.starts_with("hackarena3 @")
+        || (lower.contains("hackarena3-") && lower.ends_with(".whl"))
+}
+
+fn is_hackarena3_requirement_comment(line: &str) -> bool {
+    let trimmed = line.trim();
+    trimmed.starts_with("# hackarena3-runtime:")
+}
+
+fn is_user_requirements_hint_comment(line: &str) -> bool {
+    line.trim()
+        .eq_ignore_ascii_case("# add your own dependencies below")
+}
+
+fn ensure_python_requirements_has_wheel(
+    install_dir: &Path,
+    wheel_url: &str,
+) -> Result<(), HackArenaError> {
+    const RUNTIME_MARKER: &str = "# hackarena3-runtime: managed by hackarena-cli";
+    const USER_HINT: &str = "# add your own dependencies below";
+
+    let req_path = install_dir.join("user").join("requirements.txt");
+    if let Some(parent) = req_path.parent() {
+        ensure_dir(parent)?;
+    }
+
+    let existing = if req_path.is_file() {
+        std::fs::read_to_string(&req_path)
+            .map_err(|e| HackArenaError::io_with_path(&req_path, e))?
+    } else {
+        String::new()
+    };
+
+    let mut lines: Vec<String> = existing.lines().map(|l| l.to_string()).collect();
+    lines.retain(|line| {
+        !is_hackarena3_requirement_line(line)
+            && !is_hackarena3_requirement_comment(line)
+            && !is_user_requirements_hint_comment(line)
+    });
+    if !lines.iter().any(|line| line.trim() == wheel_url) {
+        lines.push(RUNTIME_MARKER.to_string());
+        lines.push(wheel_url.to_string());
+    }
+    if !lines
+        .iter()
+        .any(|line| line.trim().eq_ignore_ascii_case(USER_HINT))
+    {
+        lines.push(USER_HINT.to_string());
+    }
+
+    let mut out = lines.join("\n");
+    if !out.is_empty() {
+        out.push('\n');
+    }
+    std::fs::write(&req_path, out).map_err(|e| HackArenaError::io_with_path(&req_path, e))?;
+    Ok(())
+}
+
+fn install_file_atomic(src: &Path, dest: &Path) -> Result<(), HackArenaError> {
+    if let Some(parent) = dest.parent() {
+        ensure_dir(parent)?;
+    }
+
+    let tmp = dest.with_extension("new");
+    std::fs::copy(src, &tmp).map_err(|e| HackArenaError::io_with_path(&tmp, e))?;
+
+    if dest.exists() {
+        std::fs::remove_file(dest).map_err(|e| HackArenaError::io_with_path(dest, e))?;
+    }
+    std::fs::rename(&tmp, dest).map_err(|e| HackArenaError::io_with_path(dest, e))?;
+    Ok(())
+}
+
+fn is_archive_path(path: &Path) -> bool {
+    let name = path
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    name.ends_with(".zip") || name.ends_with(".tar.gz")
+}
+
+fn extract_to_temp_dir(paths: &Paths, archive_path: &Path) -> Result<TempDir, HackArenaError> {
+    let parent = paths.downloads_cache_dir();
+    let dir =
+        tempfile::tempdir_in(&parent).map_err(|e| HackArenaError::io_with_path(&parent, e))?;
+    extract_archive(archive_path, dir.path())?;
+    Ok(dir)
+}
+
+fn find_extracted_file(root: &Path, filename: &str) -> Result<PathBuf, HackArenaError> {
+    let direct = root.join(filename);
+    if direct.exists() {
+        return Ok(direct);
+    }
+
+    let mut stack = vec![root.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        let rd = std::fs::read_dir(&dir).map_err(|e| HackArenaError::io_with_path(&dir, e))?;
+        for entry in rd {
+            let entry = entry.map_err(|e| HackArenaError::io_with_path(&dir, e))?;
+            let path = entry.path();
+            let ft = entry
+                .file_type()
+                .map_err(|e| HackArenaError::io_with_path(&path, e))?;
+            if ft.is_dir() {
+                stack.push(path);
+                continue;
+            }
+            if ft.is_file()
+                && path
+                    .file_name()
+                    .and_then(|s| s.to_str())
+                    .is_some_and(|n| n.eq_ignore_ascii_case(filename))
+            {
+                return Ok(path);
+            }
+        }
+    }
+
+    Err(HackArenaError::msg(format!(
+        "auth archive did not contain expected binary `{filename}`"
+    )))
+}
+
+fn print_path_hint(paths: &Paths) {
+    println!();
+    println!("Global bin directory: {}", paths.bin_dir.display());
+    if cfg!(windows) {
+        println!(
+            "If `hackarena` can't find `ha-auth`, add this directory to your PATH (User env var) and open a new terminal."
+        );
+    } else {
+        println!(
+            "If `ha-auth` isn't found, add this directory to your PATH (e.g. in `~/.profile`):"
+        );
+        println!("  export PATH=\"{}:$PATH\"", paths.bin_dir.display());
+    }
+}
+
+async fn load_effective_config(
+    paths: &Paths,
+    project: &ProjectConfig,
+    no_cache: bool,
+    prerelease: bool,
+) -> Result<EditionConfig, HackArenaError> {
+    github_releases::load_edition_config_from_cache(paths, &project.edition, no_cache, prerelease)
+        .await
+}
+
+async fn resolve_backend_download(
+    config: &EditionConfig,
+) -> Result<Option<(String, String, String)>, HackArenaError> {
+    let backend = match config.backend.as_ref() {
+        Some(b) => b,
+        None => return Ok(None),
+    };
+
+    match &backend.source {
+        crate::config::BackendSource::Url { url } => {
+            let filename = filename_from_url(url).unwrap_or_else(|| "backend.tar.gz".into());
+            Ok(Some((url.clone(), filename, backend.sha256.clone())))
+        }
+    }
+}
+
+async fn resolve_project_backend_manifest(
+    config: &EditionConfig,
+) -> Result<Option<ProjectInstalledBundle>, HackArenaError> {
+    let Some((url, _cache_filename, sha256)) = resolve_backend_download(config).await? else {
+        return Ok(None);
+    };
+    Ok(Some(ProjectInstalledBundle {
+        url,
+        install_dir: PathBuf::from(PROJECT_BACKEND_DIR),
+        sha256: Some(sha256),
+        installed_at_unix: Some(unix_time_seconds()),
+        files: vec![],
+    }))
+}
+
+fn filename_from_url(url: &str) -> Option<String> {
+    if let Some((_, query)) = url.split_once('?') {
+        for item in query.split('&') {
+            if let Some(name) = item.strip_prefix("asset_name=")
+                && !name.is_empty()
+            {
+                return Some(name.to_string());
+            }
+        }
+    }
+
+    url.split('?')
+        .next()
+        .unwrap_or(url)
+        .split('/')
+        .next_back()
+        .map(|s| s.to_string())
+        .filter(|s| !s.is_empty())
+}
+
+fn discover_installed_wrappers(cwd: &Path) -> Vec<String> {
+    let dir = cwd.join(PROJECT_WRAPPERS_DIR);
+    let mut out = Vec::new();
+    if let Ok(rd) = std::fs::read_dir(dir) {
+        for e in rd.flatten() {
+            if let Ok(ft) = e.file_type() {
+                if ft.is_dir() {
+                    if let Some(name) = e.file_name().to_str() {
+                        out.push(name.to_string());
+                    }
+                }
+            }
+        }
+    }
+    out.sort();
+    out
+}
+
+fn next_wrapper_instance_id(root: &Path, base_id: &str) -> String {
+    if !root.join(base_id).exists() {
+        return base_id.to_string();
+    }
+    for idx in 1..usize::MAX {
+        let candidate = format!("{base_id}_{idx}");
+        if !root.join(&candidate).exists() {
+            return candidate;
+        }
+    }
+    base_id.to_string()
+}
+
+fn confirm_install_new_wrapper_instance(
+    base_id: &str,
+    next_id: &str,
+) -> Result<bool, HackArenaError> {
+    if !(io::stdin().is_terminal() && io::stdout().is_terminal()) {
+        println!(
+            "Wrapper `{base_id}` already exists. Non-interactive mode detected; not creating `{next_id}` automatically."
+        );
+        return Ok(false);
+    }
+
+    let mut stdout = io::stdout();
+    write!(
+        &mut stdout,
+        "Wrapper `{base_id}` already exists. Install another instance `{next_id}`? [y/N]: "
+    )
+    .map_err(HackArenaError::Io)?;
+    stdout.flush().map_err(HackArenaError::Io)?;
+
+    let mut input = String::new();
+    io::stdin()
+        .read_line(&mut input)
+        .map_err(HackArenaError::Io)?;
+    let trimmed = input.trim().to_ascii_lowercase();
+    Ok(trimmed == "y" || trimmed == "yes")
+}
+
+fn backend_dir_needs_repair(
+    manifest: &ProjectManifest,
+    backend_rel_path: &Path,
+    backend_abs_path: &Path,
+) -> Result<bool, HackArenaError> {
+    let tracked = manifest
+        .backend
+        .as_ref()
+        .is_some_and(|b| b.install_dir == backend_rel_path);
+    let has_files = dir_has_entries(backend_abs_path)?;
+    Ok(!tracked || !has_files)
+}
+
+fn dir_has_entries(path: &Path) -> Result<bool, HackArenaError> {
+    if !path.is_dir() {
+        return Ok(false);
+    }
+    let mut rd = std::fs::read_dir(path).map_err(|e| HackArenaError::io_with_path(path, e))?;
+    Ok(rd.next().is_some())
+}
+
+fn choose_wrapper_id(
+    project: &ProjectConfig,
+    config: &EditionConfig,
+    installed: &[String],
+) -> Result<Option<String>, HackArenaError> {
+    if let Some(wrapper_id) = project.wrapper_id.as_ref() {
+        if config
+            .wrapper(github_releases::wrapper_base_id(wrapper_id))
+            .is_some()
+        {
+            return Ok(Some(wrapper_id.clone()));
+        }
+    }
+    if installed.len() == 1 {
+        return Ok(Some(installed[0].clone()));
+    }
+    if installed.is_empty() {
+        if config.wrappers.len() == 1 {
+            return Ok(Some(config.wrappers[0].id.clone()));
+        }
+        return Ok(None);
+    }
+    Ok(None)
+}
+
+fn unix_time_seconds() -> u64 {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        deploy_wrapper_archive, ensure_python_requirements_has_wheel,
+        ensure_python_wrapper_env_api_url, validate_wrapper_install_layout, vendor_python_wheel,
+    };
+    use std::fs;
+    use std::io::Write;
+    use std::path::Path;
+    use zip::write::SimpleFileOptions;
+
+    fn create_wrapper_zip(path: &Path, entries: &[(&str, &str)]) {
+        let file = fs::File::create(path).expect("create zip");
+        let mut zip = zip::ZipWriter::new(file);
+        let opts =
+            SimpleFileOptions::default().compression_method(zip::CompressionMethod::Deflated);
+        for (name, content) in entries {
+            zip.start_file(name, opts).expect("start file");
+            zip.write_all(content.as_bytes()).expect("write file");
+        }
+        zip.finish().expect("finish zip");
+    }
+
+    #[test]
+    fn wrapper_layout_validation_accepts_root_manifest() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        fs::create_dir_all(dir.path().join("user").join("src")).expect("user dir");
+        fs::write(dir.path().join("manifest.toml"), "schema = 1").expect("manifest");
+
+        validate_wrapper_install_layout("python", dir.path()).expect("layout should pass");
+    }
+
+    #[test]
+    fn wrapper_layout_validation_accepts_system_manifest() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        fs::create_dir_all(dir.path().join("user")).expect("user dir");
+        fs::create_dir_all(dir.path().join("system")).expect("system dir");
+        fs::write(
+            dir.path().join("system").join("manifest.toml"),
+            "schema = 1",
+        )
+        .expect("manifest");
+
+        validate_wrapper_install_layout("python", dir.path()).expect("layout should pass");
+    }
+
+    #[test]
+    fn wrapper_layout_validation_fails_when_user_missing() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        fs::write(dir.path().join("manifest.toml"), "schema = 1").expect("manifest");
+
+        let err = validate_wrapper_install_layout("python", dir.path()).expect_err("should fail");
+        assert!(err.to_string().contains("missing `user/`"));
+    }
+
+    #[test]
+    fn wrapper_layout_validation_fails_when_manifest_missing() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        fs::create_dir_all(dir.path().join("user")).expect("user dir");
+
+        let err = validate_wrapper_install_layout("python", dir.path()).expect_err("should fail");
+        assert!(err.to_string().contains("missing `manifest.toml`"));
+    }
+
+    #[test]
+    fn ensure_python_requirements_has_wheel_adds_and_updates_single_entry() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let req_path = dir.path().join("user").join("requirements.txt");
+        fs::create_dir_all(req_path.parent().expect("parent")).expect("mkdir");
+        fs::write(
+            &req_path,
+            "requests==2.32.0\nhttps://github.com/INIT-SGGW/HackArena3.0-ApiWrapper-Python/releases/download/v0.1.0/hackarena3-0.1.0-py3-none-any.whl\n# hackarena3-runtime: managed by hackarena-cli\n./.vendor/hackarena3-0.0.9-py3-none-any.whl\n",
+        )
+        .expect("write");
+
+        let wheel = "./.vendor/hackarena3-0.1.0b1-py3-none-any.whl";
+        ensure_python_requirements_has_wheel(dir.path(), wheel).expect("update req");
+        ensure_python_requirements_has_wheel(dir.path(), wheel).expect("idempotent");
+
+        let content = fs::read_to_string(&req_path).expect("read");
+        let lines = content.lines().collect::<Vec<_>>();
+        assert_eq!(
+            lines,
+            vec![
+                "requests==2.32.0",
+                "# hackarena3-runtime: managed by hackarena-cli",
+                wheel,
+                "# add your own dependencies below"
+            ]
+        );
+    }
+
+    #[test]
+    fn vendor_python_wheel_places_file_in_user_vendor_dir() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let install_dir = dir.path().join("wrapper");
+        fs::create_dir_all(install_dir.join("user")).expect("user dir");
+
+        let cached = dir.path().join("hackarena3-0.1.0b1-py3-none-any.whl");
+        fs::write(&cached, b"wheel-bytes").expect("write cached");
+
+        let rel = vendor_python_wheel(&install_dir, &cached).expect("vendor");
+        assert_eq!(rel, "./.vendor/hackarena3-0.1.0b1-py3-none-any.whl");
+        let vendored = install_dir
+            .join("user")
+            .join(".vendor")
+            .join("hackarena3-0.1.0b1-py3-none-any.whl");
+        assert!(vendored.is_file());
+    }
+
+    #[test]
+    fn ensure_python_wrapper_env_api_url_creates_env_when_missing() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let install_dir = dir.path().join("wrapper");
+        fs::create_dir_all(install_dir.join("user")).expect("user dir");
+
+        ensure_python_wrapper_env_api_url(&install_dir).expect("create env");
+        let content = fs::read_to_string(install_dir.join("user").join(".env")).expect("read env");
+        assert_eq!(content, "HA3_WRAPPER_API_URL=ha3-api.hackarena.pl\n");
+    }
+
+    #[test]
+    fn ensure_python_wrapper_env_api_url_appends_when_key_missing() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let install_dir = dir.path().join("wrapper");
+        fs::create_dir_all(install_dir.join("user")).expect("user dir");
+        fs::write(install_dir.join("user").join(".env"), "OTHER=1\n").expect("write env");
+
+        ensure_python_wrapper_env_api_url(&install_dir).expect("append key");
+        let content = fs::read_to_string(install_dir.join("user").join(".env")).expect("read env");
+        assert_eq!(
+            content,
+            "OTHER=1\nHA3_WRAPPER_API_URL=ha3-api.hackarena.pl\n"
+        );
+    }
+
+    #[test]
+    fn ensure_python_wrapper_env_api_url_keeps_existing_value() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let install_dir = dir.path().join("wrapper");
+        fs::create_dir_all(install_dir.join("user")).expect("user dir");
+        fs::write(
+            install_dir.join("user").join(".env"),
+            "HA3_WRAPPER_API_URL=http://localhost:8090\n",
+        )
+        .expect("write env");
+
+        ensure_python_wrapper_env_api_url(&install_dir).expect("no override");
+        let content = fs::read_to_string(install_dir.join("user").join(".env")).expect("read env");
+        assert_eq!(content, "HA3_WRAPPER_API_URL=http://localhost:8090\n");
+    }
+
+    #[test]
+    fn deploy_wrapper_archive_preserves_existing_user_dir_on_update() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let install_dir = dir.path().join("wrapper");
+        fs::create_dir_all(install_dir.join("user").join("src")).expect("mkdir");
+        fs::write(
+            install_dir.join("user").join("src").join("main.py"),
+            "print('keep')",
+        )
+        .expect("write user");
+        fs::write(install_dir.join("manifest.toml"), "schema = 1").expect("write old manifest");
+
+        let archive = dir.path().join("wrapper-python.zip");
+        create_wrapper_zip(
+            &archive,
+            &[
+                ("system/manifest.toml", "schema = 1\n"),
+                ("user/src/template.py", "print('template')\n"),
+            ],
+        );
+
+        deploy_wrapper_archive("python", &archive, &install_dir, true).expect("deploy");
+
+        assert!(install_dir.join("system").join("manifest.toml").is_file());
+        assert!(
+            install_dir
+                .join("user")
+                .join("src")
+                .join("main.py")
+                .is_file()
+        );
+        assert!(
+            !install_dir
+                .join("user")
+                .join("src")
+                .join("template.py")
+                .exists()
+        );
+    }
+}

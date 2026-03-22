@@ -1,0 +1,33 @@
+[package]
+name = "hackarena-cli"
+version = "0.1.0-beta.1"
+edition = "2024"
+
+[dependencies]
+clap = { version = "4.5", features = ["derive"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "fs", "io-util"] }
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "stream", "json"] }
+toml = "0.8"
+globset = "0.4"
+sha2 = "0.10"
+hex = "0.4"
+zip = { version = "7", default-features = false, features = ["deflate"] }
+tar = "0.4"
+flate2 = "1"
+tempfile = "3"
+futures-util = "0.3"
+cfg-if = "1"
+owo-colors = "4"
+rpassword = "7.3.1"
+
+[profile.release]
+lto = true
+codegen-units = 1
+strip = "symbols"
+
+[[bin]]
+name = "hackarena"
+path = "src/main.rs"
