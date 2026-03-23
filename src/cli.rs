@@ -1,4 +1,4 @@
-use clap::{Parser, Subcommand};
+use clap::{Parser, Subcommand, ValueEnum};
 
 /// HackArena bootstrap CLI.
 #[derive(Parser, Debug)]
@@ -16,12 +16,23 @@ pub struct Cli {
     pub command: Command,
 }
 
+#[derive(Copy, Clone, Debug, Eq, PartialEq, ValueEnum)]
+pub enum LinuxLibcArg {
+    Auto,
+    Gnu,
+    Musl,
+}
+
 #[derive(Subcommand, Debug)]
 pub enum Command {
     /// Update installed components in the current project.
     Update {
         #[command(subcommand)]
         component: Option<UpdateSubcommand>,
+
+        /// Linux libc mode for release asset selection (`auto`, `gnu`, `musl`).
+        #[arg(long, value_enum, hide = !cfg!(target_os = "linux"))]
+        linux_libc: Option<LinuxLibcArg>,
 
         /// Do not use cached release metadata (always fetch from network).
         #[arg(long)]
@@ -39,6 +50,10 @@ pub enum Command {
     Install {
         #[command(subcommand)]
         component: Option<InstallSubcommand>,
+
+        /// Linux libc mode for release asset selection (`auto`, `gnu`, `musl`).
+        #[arg(long, value_enum, hide = !cfg!(target_os = "linux"))]
+        linux_libc: Option<LinuxLibcArg>,
 
         /// Skip installing wrapper.
         #[arg(long)]

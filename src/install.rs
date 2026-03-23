@@ -8,7 +8,7 @@ use crate::config::{
 use crate::constants::{PROJECT_BACKEND_DIR, PROJECT_WRAPPERS_DIR};
 use crate::download::{download_to_cache, sha256_file_hex};
 use crate::error::HackArenaError;
-use crate::github_releases;
+use crate::github_releases::{self, LinuxLibcMode};
 use std::io::{self, IsTerminal, Write};
 use std::path::{Path, PathBuf};
 use tempfile::TempDir;
@@ -43,6 +43,7 @@ pub async fn install(
     skip_wrapper: bool,
     no_cache: bool,
     prerelease: bool,
+    linux_libc: Option<LinuxLibcMode>,
 ) -> Result<(), HackArenaError> {
     let cwd = std::env::current_dir().map_err(HackArenaError::Io)?;
     if !is_project_dir(&cwd) {
@@ -56,7 +57,7 @@ pub async fn install(
     let backend_dir = cwd.join(&project.backend_dir);
     let mut manifest = load_project_manifest(&cwd)?;
 
-    let config = load_effective_config(paths, &project, no_cache, prerelease).await?;
+    let config = load_effective_config(paths, &project, no_cache, prerelease, linux_libc).await?;
     let installed_wrappers = discover_installed_wrappers(&cwd);
     let chosen_wrapper = choose_wrapper_id(&project, &config, &installed_wrappers)?;
     let mut backend_installed_now = false;
@@ -115,6 +116,7 @@ pub async fn install(
                         None,
                         &wrapper.filename,
                         &wrapper.sha256,
+                        linux_libc,
                     )
                     .await?;
                     wrapper_installed_now = true;
@@ -138,6 +140,7 @@ pub async fn install(
                         None,
                         &wrapper.filename,
                         &wrapper.sha256,
+                        linux_libc,
                     )
                     .await?;
                     wrapper_installed_now = true;
@@ -175,9 +178,14 @@ pub async fn install(
 }
 
 /// Updates installed components in the current project.
-pub async fn update(paths: &Paths, no_cache: bool, prerelease: bool) -> Result<(), HackArenaError> {
-    update_auth(paths, no_cache, prerelease).await?;
-    update_backend(paths, no_cache, prerelease).await?;
+pub async fn update(
+    paths: &Paths,
+    no_cache: bool,
+    prerelease: bool,
+    linux_libc: Option<LinuxLibcMode>,
+) -> Result<(), HackArenaError> {
+    update_auth(paths, no_cache, prerelease, linux_libc).await?;
+    update_backend(paths, no_cache, prerelease, linux_libc).await?;
     let cwd = std::env::current_dir().map_err(HackArenaError::Io)?;
     let project = load_project_config(&cwd)?;
     let manifest = load_project_manifest(&cwd).unwrap_or_default();
@@ -187,7 +195,7 @@ pub async fn update(paths: &Paths, no_cache: bool, prerelease: bool) -> Result<(
             println!("Wrapper `{wrapper_id}`: skip update (not configured for this edition).");
             continue;
         }
-        update_wrapper(paths, &wrapper_id, no_cache, prerelease, None).await?;
+        update_wrapper(paths, &wrapper_id, no_cache, prerelease, None, linux_libc).await?;
     }
     Ok(())
 }
@@ -197,6 +205,7 @@ pub async fn update_auth(
     paths: &Paths,
     no_cache: bool,
     prerelease: bool,
+    linux_libc: Option<LinuxLibcMode>,
 ) -> Result<(), HackArenaError> {
     let cwd = std::env::current_dir().map_err(HackArenaError::Io)?;
     if !is_project_dir(&cwd) {
@@ -208,7 +217,7 @@ pub async fn update_auth(
 
     let project = load_project_config(&cwd)?;
     validate_edition(&project.edition)?;
-    let config = load_effective_config(paths, &project, no_cache, prerelease).await?;
+    let config = load_effective_config(paths, &project, no_cache, prerelease, linux_libc).await?;
 
     let auth_path = paths.bin_dir.join(&config.bin_name_auth);
     let current_sha = sha256_file_hex(&auth_path).ok();
@@ -234,6 +243,7 @@ pub async fn update_backend(
     paths: &Paths,
     no_cache: bool,
     prerelease: bool,
+    linux_libc: Option<LinuxLibcMode>,
 ) -> Result<(), HackArenaError> {
     let cwd = std::env::current_dir().map_err(HackArenaError::Io)?;
     if !is_project_dir(&cwd) {
@@ -245,7 +255,8 @@ pub async fn update_backend(
 
     let project = load_project_config(&cwd)?;
     validate_edition(&project.edition)?;
-    let mut config = load_effective_config(paths, &project, no_cache, prerelease).await?;
+    let mut config =
+        load_effective_config(paths, &project, no_cache, prerelease, linux_libc).await?;
     if config.backend.is_none() {
         return Err(HackArenaError::msg(format!(
             "No backend release is available yet for edition `{}`.",
@@ -274,7 +285,7 @@ pub async fn update_backend(
     let backend_dir = cwd.join(&project.backend_dir);
     if let Err(err) = install_backend_to_dir(paths, &config, &backend_dir, true).await {
         if matches!(err, HackArenaError::ChecksumMismatch { .. }) {
-            config = load_effective_config(paths, &project, true, prerelease).await?;
+            config = load_effective_config(paths, &project, true, prerelease, linux_libc).await?;
             install_backend_to_dir(paths, &config, &backend_dir, true).await?;
         } else {
             return Err(err);
@@ -293,6 +304,7 @@ pub async fn install_auth(
     paths: &Paths,
     no_cache: bool,
     prerelease: bool,
+    linux_libc: Option<LinuxLibcMode>,
 ) -> Result<(), HackArenaError> {
     let cwd = std::env::current_dir().map_err(HackArenaError::Io)?;
     if !is_project_dir(&cwd) {
@@ -302,7 +314,7 @@ pub async fn install_auth(
         )));
     }
     let project = load_project_config(&cwd)?;
-    let config = load_effective_config(paths, &project, no_cache, prerelease).await?;
+    let config = load_effective_config(paths, &project, no_cache, prerelease, linux_libc).await?;
     install_auth_with_config(paths, &config).await?;
     print_path_hint(paths);
     Ok(())
@@ -313,6 +325,7 @@ pub async fn install_backend(
     paths: &Paths,
     no_cache: bool,
     prerelease: bool,
+    linux_libc: Option<LinuxLibcMode>,
 ) -> Result<(), HackArenaError> {
     let cwd = std::env::current_dir().map_err(HackArenaError::Io)?;
     let project = if is_project_dir(&cwd) {
@@ -324,7 +337,7 @@ pub async fn install_backend(
         )));
     };
 
-    let config = load_effective_config(paths, &project, no_cache, prerelease).await?;
+    let config = load_effective_config(paths, &project, no_cache, prerelease, linux_libc).await?;
     if config.backend.is_none() {
         return Err(HackArenaError::msg(format!(
             "No backend release is available yet for edition `{}`.",
@@ -360,6 +373,7 @@ pub async fn install_wrapper(
     no_cache: bool,
     prerelease: bool,
     release_tag: Option<&str>,
+    linux_libc: Option<LinuxLibcMode>,
 ) -> Result<(), HackArenaError> {
     let cwd = std::env::current_dir().map_err(HackArenaError::Io)?;
     let project = if is_project_dir(&cwd) {
@@ -393,7 +407,7 @@ pub async fn install_wrapper(
         }
     }
     let wrapper_dir = wrappers_root.join(&target_wrapper_id);
-    let config = load_effective_config(paths, &project, no_cache, prerelease).await?;
+    let config = load_effective_config(paths, &project, no_cache, prerelease, linux_libc).await?;
     let (wrapper_url, wrapper_sha) = resolve_wrapper_target(
         paths,
         &project,
@@ -402,6 +416,7 @@ pub async fn install_wrapper(
         no_cache,
         prerelease,
         release_tag,
+        linux_libc,
     )
     .await?;
     let preserve_existing_user = if wrapper_dir.exists() {
@@ -435,6 +450,7 @@ pub async fn install_wrapper(
         release_tag,
         &wrapper_url,
         &wrapper_sha,
+        linux_libc,
     )
     .await?;
 
@@ -459,6 +475,7 @@ pub async fn update_wrapper(
     no_cache: bool,
     prerelease: bool,
     release_tag: Option<&str>,
+    linux_libc: Option<LinuxLibcMode>,
 ) -> Result<(), HackArenaError> {
     let cwd = std::env::current_dir().map_err(HackArenaError::Io)?;
     if !is_project_dir(&cwd) {
@@ -479,7 +496,7 @@ pub async fn update_wrapper(
         )));
     }
 
-    let config = load_effective_config(paths, &project, no_cache, prerelease).await?;
+    let config = load_effective_config(paths, &project, no_cache, prerelease, linux_libc).await?;
     let managed_wrapper_id = github_releases::wrapper_base_id(wrapper_id).to_string();
     let (wrapper_url, wrapper_sha) = resolve_wrapper_target(
         paths,
@@ -489,6 +506,7 @@ pub async fn update_wrapper(
         no_cache,
         prerelease,
         release_tag,
+        linux_libc,
     )
     .await?;
 
@@ -512,6 +530,7 @@ pub async fn update_wrapper(
         release_tag,
         &wrapper_url,
         &wrapper_sha,
+        linux_libc,
     )
     .await?;
 
@@ -537,6 +556,7 @@ async fn resolve_wrapper_target(
     no_cache: bool,
     _prerelease: bool,
     release_tag: Option<&str>,
+    linux_libc: Option<LinuxLibcMode>,
 ) -> Result<(String, String), HackArenaError> {
     if let Some(tag) = release_tag {
         if !github_releases::has_wrapper_repo(&project.edition, managed_wrapper_id) {
@@ -550,6 +570,7 @@ async fn resolve_wrapper_target(
             managed_wrapper_id,
             tag,
             no_cache,
+            linux_libc,
         )
         .await?
         else {
@@ -662,6 +683,7 @@ async fn install_wrapper_to_dir(
     release_tag: Option<&str>,
     wrapper_url: &str,
     wrapper_sha: &str,
+    linux_libc: Option<LinuxLibcMode>,
 ) -> Result<(), HackArenaError> {
     ensure_dir(&paths.downloads_cache_dir())?;
     if let Some(parent) = install_dir.parent() {
@@ -703,6 +725,7 @@ async fn install_wrapper_to_dir(
             managed_wrapper_id,
             tag,
             no_cache,
+            linux_libc,
         )
         .await?
     } else {
@@ -712,6 +735,7 @@ async fn install_wrapper_to_dir(
             managed_wrapper_id,
             no_cache,
             prerelease,
+            linux_libc,
         )
         .await?
     };
@@ -1023,9 +1047,16 @@ async fn load_effective_config(
     project: &ProjectConfig,
     no_cache: bool,
     prerelease: bool,
+    linux_libc: Option<LinuxLibcMode>,
 ) -> Result<EditionConfig, HackArenaError> {
-    github_releases::load_edition_config_from_cache(paths, &project.edition, no_cache, prerelease)
-        .await
+    github_releases::load_edition_config_from_cache(
+        paths,
+        &project.edition,
+        no_cache,
+        prerelease,
+        linux_libc,
+    )
+    .await
 }
 
 async fn resolve_backend_download(

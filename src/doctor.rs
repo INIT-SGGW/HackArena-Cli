@@ -90,8 +90,14 @@ async fn load_effective_config(
     no_cache: bool,
     prerelease: bool,
 ) -> Result<crate::config::EditionConfig, HackArenaError> {
-    github_releases::load_edition_config_from_cache(paths, &project.edition, no_cache, prerelease)
-        .await
+    github_releases::load_edition_config_from_cache(
+        paths,
+        &project.edition,
+        no_cache,
+        prerelease,
+        None,
+    )
+    .await
 }
 
 fn print_check(label: &str, ok: bool, path: &Path) {
@@ -208,9 +214,14 @@ pub async fn status(
         .and_then(|a| a.sha256.as_deref())
         .map(|s| s.to_string())
         .or_else(|| sha256_file_hex(&auth_path).ok());
-    let latest_auth =
-        github_releases::latest_auth_from_releases(paths, &project.edition, no_cache, prerelease)
-            .await;
+    let latest_auth = github_releases::latest_auth_from_releases(
+        paths,
+        &project.edition,
+        no_cache,
+        prerelease,
+        None,
+    )
+    .await;
     let current_auth_version = current_auth_version_from_binary(&auth_path);
     let latest_auth_version = latest_auth
         .as_ref()
@@ -249,6 +260,7 @@ pub async fn status(
         &project.edition,
         no_cache,
         prerelease,
+        None,
     )
     .await;
     let current_backend = project_manifest.as_ref().and_then(|m| m.backend.as_ref());
@@ -318,6 +330,7 @@ pub async fn status(
             wrapper_id,
             no_cache,
             prerelease,
+            None,
         )
         .await;
         let latest_wrapper_version = latest
@@ -411,6 +424,9 @@ fn print_verbose_runtime(no_cache: bool, prerelease: bool) {
     println!("Verbose: cache: {cache_mode}");
     println!("Verbose: release channel: {channel}");
     println!("Verbose: GH_TOKEN/GITHUB_TOKEN: {token}");
+    if let Ok(Some(linux_libc)) = github_releases::linux_libc_verbose_summary(None) {
+        println!("Verbose: linux libc: {linux_libc}");
+    }
 }
 
 fn github_token_present() -> bool {
@@ -585,6 +601,8 @@ fn strip_known_triple_suffix(value: &str) -> &str {
     const TRIPLES: &[&str] = &[
         "x86_64-pc-windows-msvc",
         "aarch64-pc-windows-msvc",
+        "x86_64-unknown-linux-gnu",
+        "aarch64-unknown-linux-gnu",
         "x86_64-unknown-linux-musl",
         "aarch64-unknown-linux-musl",
         "x86_64-apple-darwin",

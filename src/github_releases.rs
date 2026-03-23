@@ -7,7 +7,9 @@ use crate::error::HackArenaError;
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
+use std::fs;
 use std::path::{Path, PathBuf};
+use std::process::Command;
 use std::time::{Duration, SystemTime};
 
 const AUTH_REPO: &str = "INIT-SGGW/HackArena-Auth-Cli";
@@ -16,6 +18,47 @@ const WRAPPERS_EDITION_3: &[(&str, &str)] =
     &[("python", "INIT-SGGW/HackArena3.0-ApiWrapper-Python")];
 const CHECKSUMS_ASSET_NAME: &str = "SHA256SUMS.txt";
 const RELEASE_CACHE_TTL: Duration = Duration::from_secs(300);
+const LINUX_LIBC_ENV: &str = "HACKARENA_LINUX_LIBC";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LinuxLibcMode {
+    Auto,
+    Gnu,
+    Musl,
+}
+
+impl LinuxLibcMode {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Auto => "auto",
+            Self::Gnu => "gnu",
+            Self::Musl => "musl",
+        }
+    }
+
+    fn parse(value: &str) -> Option<Self> {
+        let lowered = value.trim().to_ascii_lowercase();
+        match lowered.as_str() {
+            "auto" => Some(Self::Auto),
+            "gnu" => Some(Self::Gnu),
+            "musl" => Some(Self::Musl),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct TargetTripleResolution {
+    triples: Vec<&'static str>,
+    linux_details: Option<LinuxModeDetails>,
+}
+
+#[derive(Debug, Clone)]
+struct LinuxModeDetails {
+    mode: LinuxLibcMode,
+    source: &'static str,
+    order_label: &'static str,
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct GithubRelease {
@@ -90,13 +133,14 @@ pub async fn load_edition_config_from_cache(
     edition: &str,
     no_cache: bool,
     prerelease: bool,
+    linux_libc_override: Option<LinuxLibcMode>,
 ) -> Result<EditionConfig, HackArenaError> {
     let repos = repos_for_edition(edition).ok_or_else(|| {
         HackArenaError::msg(format!(
             "GitHub Releases mapping is not configured for edition `{edition}`"
         ))
     })?;
-    let target = current_target_triple()?;
+    let target = current_target_triples(linux_libc_override)?;
     let use_cache = !no_cache;
     let allow_prerelease = prerelease;
 
@@ -104,7 +148,7 @@ pub async fn load_edition_config_from_cache(
         paths,
         repos.auth_repo,
         ComponentSelector::Auth,
-        target,
+        &target,
         use_cache,
         allow_prerelease,
     )
@@ -115,7 +159,7 @@ pub async fn load_edition_config_from_cache(
             paths,
             repo,
             ComponentSelector::Backend,
-            target,
+            &target,
             use_cache,
             allow_prerelease,
         )
@@ -133,7 +177,7 @@ pub async fn load_edition_config_from_cache(
             paths,
             repo,
             ComponentSelector::Wrapper(wrapper_id),
-            target,
+            &target,
             use_cache,
             allow_prerelease,
         )
@@ -171,8 +215,11 @@ pub async fn latest_auth_from_releases(
     edition: &str,
     no_cache: bool,
     prerelease: bool,
+    linux_libc_override: Option<LinuxLibcMode>,
 ) -> Result<(String, String), HackArenaError> {
-    let cfg = load_edition_config_from_cache(paths, edition, no_cache, prerelease).await?;
+    let cfg =
+        load_edition_config_from_cache(paths, edition, no_cache, prerelease, linux_libc_override)
+            .await?;
     Ok((cfg.auth_artifact.filename, cfg.auth_artifact.sha256))
 }
 
@@ -181,8 +228,11 @@ pub async fn latest_backend_from_releases(
     edition: &str,
     no_cache: bool,
     prerelease: bool,
+    linux_libc_override: Option<LinuxLibcMode>,
 ) -> Result<Option<ProjectInstalledBundle>, HackArenaError> {
-    let cfg = load_edition_config_from_cache(paths, edition, no_cache, prerelease).await?;
+    let cfg =
+        load_edition_config_from_cache(paths, edition, no_cache, prerelease, linux_libc_override)
+            .await?;
     let Some(backend) = cfg.backend.as_ref() else {
         return Ok(None);
     };
@@ -202,8 +252,11 @@ pub async fn latest_wrapper_from_releases(
     wrapper_id: &str,
     no_cache: bool,
     prerelease: bool,
+    linux_libc_override: Option<LinuxLibcMode>,
 ) -> Result<Option<ProjectInstalledBundle>, HackArenaError> {
-    let cfg = load_edition_config_from_cache(paths, edition, no_cache, prerelease).await?;
+    let cfg =
+        load_edition_config_from_cache(paths, edition, no_cache, prerelease, linux_libc_override)
+            .await?;
     let base_id = wrapper_base_id(wrapper_id);
     let Some(wrapper) = cfg.wrapper(base_id) else {
         return Ok(None);
@@ -223,19 +276,24 @@ pub async fn wrapper_from_release_tag(
     wrapper_id: &str,
     release_tag: &str,
     no_cache: bool,
+    linux_libc_override: Option<LinuxLibcMode>,
 ) -> Result<Option<ProjectInstalledBundle>, HackArenaError> {
     let Some(repo) = wrapper_repo_for_edition(edition, wrapper_id) else {
         return Ok(None);
     };
     let base_id = wrapper_base_id(wrapper_id);
-    let target = current_target_triple()?;
+    let target = current_target_triples(linux_libc_override)?;
     let use_cache = !no_cache;
     let Some(release) = release_by_tag(paths, repo, release_tag, use_cache).await? else {
         return Ok(None);
     };
-    let asset =
-        resolve_component_from_release(repo, &release, ComponentSelector::Wrapper(base_id), target)
-            .await?;
+    let asset = resolve_component_from_release(
+        repo,
+        &release,
+        ComponentSelector::Wrapper(base_id),
+        &target,
+    )
+    .await?;
     Ok(Some(ProjectInstalledBundle {
         url: asset.url,
         install_dir: PathBuf::from(PROJECT_WRAPPERS_DIR).join(wrapper_id),
@@ -251,17 +309,18 @@ pub async fn latest_wrapper_python_wheel_from_releases(
     wrapper_id: &str,
     no_cache: bool,
     prerelease: bool,
+    linux_libc_override: Option<LinuxLibcMode>,
 ) -> Result<Option<ArtifactSpec>, HackArenaError> {
     let Some(repo) = wrapper_repo_for_edition(edition, wrapper_id) else {
         return Ok(None);
     };
     let base_id = wrapper_base_id(wrapper_id);
     let use_cache = !no_cache;
-    let target = current_target_triple()?;
+    let target = current_target_triples(linux_libc_override)?;
     let Some(release) = latest_release(paths, repo, use_cache, prerelease).await? else {
         return Ok(None);
     };
-    resolve_python_wheel_from_release(repo, base_id, target, &release)
+    resolve_python_wheel_from_release(repo, base_id, &target, &release)
         .await
         .map(Some)
 }
@@ -272,17 +331,18 @@ pub async fn wrapper_python_wheel_from_release_tag(
     wrapper_id: &str,
     release_tag: &str,
     no_cache: bool,
+    linux_libc_override: Option<LinuxLibcMode>,
 ) -> Result<Option<ArtifactSpec>, HackArenaError> {
     let Some(repo) = wrapper_repo_for_edition(edition, wrapper_id) else {
         return Ok(None);
     };
     let base_id = wrapper_base_id(wrapper_id);
     let use_cache = !no_cache;
-    let target = current_target_triple()?;
+    let target = current_target_triples(linux_libc_override)?;
     let Some(release) = release_by_tag(paths, repo, release_tag, use_cache).await? else {
         return Ok(None);
     };
-    resolve_python_wheel_from_release(repo, base_id, target, &release)
+    resolve_python_wheel_from_release(repo, base_id, &target, &release)
         .await
         .map(Some)
 }
@@ -313,12 +373,12 @@ async fn resolve_required_component(
     paths: &Paths,
     repo: &str,
     component: ComponentSelector<'_>,
-    triple: &str,
+    target: &TargetTripleResolution,
     use_cache: bool,
     allow_prerelease: bool,
 ) -> Result<ResolvedReleaseAsset, HackArenaError> {
     let Some(asset) =
-        resolve_optional_component(paths, repo, component, triple, use_cache, allow_prerelease)
+        resolve_optional_component(paths, repo, component, target, use_cache, allow_prerelease)
             .await?
     else {
         return Err(HackArenaError::msg(format!(
@@ -333,14 +393,14 @@ async fn resolve_optional_component(
     paths: &Paths,
     repo: &str,
     component: ComponentSelector<'_>,
-    triple: &str,
+    target: &TargetTripleResolution,
     use_cache: bool,
     allow_prerelease: bool,
 ) -> Result<Option<ResolvedReleaseAsset>, HackArenaError> {
     let Some(release) = latest_release(paths, repo, use_cache, allow_prerelease).await? else {
         return Ok(None);
     };
-    resolve_component_from_release(repo, &release, component, triple)
+    resolve_component_from_release(repo, &release, component, target)
         .await
         .map(Some)
 }
@@ -349,10 +409,10 @@ async fn resolve_component_from_release(
     repo: &str,
     release: &GithubRelease,
     component: ComponentSelector<'_>,
-    triple: &str,
+    target: &TargetTripleResolution,
 ) -> Result<ResolvedReleaseAsset, HackArenaError> {
     let checksums = fetch_release_checksums(repo, release).await?;
-    let selected = select_component_asset(&release.assets, component, triple)?;
+    let selected = select_component_asset(&release.assets, component, target)?;
     let expected_sha = find_checksum_for_asset(&checksums, &selected.name).ok_or_else(|| {
         HackArenaError::msg(format!(
             "Checksum for asset `{}` not found in `{CHECKSUMS_ASSET_NAME}` (repo `{repo}`, release `{}`).",
@@ -370,7 +430,7 @@ async fn resolve_component_from_release(
 async fn resolve_python_wheel_from_release(
     repo: &str,
     wrapper_id: &str,
-    triple: &str,
+    target: &TargetTripleResolution,
     release: &GithubRelease,
 ) -> Result<ArtifactSpec, HackArenaError> {
     let checksums = fetch_release_checksums(repo, release).await?;
@@ -378,7 +438,7 @@ async fn resolve_python_wheel_from_release(
     let wrapper_asset = select_component_asset(
         &release.assets,
         ComponentSelector::Wrapper(wrapper_id),
-        triple,
+        target,
     )?;
     let wrapper_version = extract_wrapper_version_from_asset_name(&wrapper_asset.name, wrapper_id)
         .ok_or_else(|| {
@@ -548,67 +608,73 @@ fn cache_path_for_repo_tag(paths: &Paths, repo: &str, release_tag: &str) -> Path
 fn select_component_asset<'a>(
     assets: &'a [GithubAsset],
     component: ComponentSelector<'_>,
-    triple: &str,
+    target: &TargetTripleResolution,
 ) -> Result<&'a GithubAsset, HackArenaError> {
     match component {
-        ComponentSelector::Wrapper(wrapper_id) => select_wrapper_asset(assets, wrapper_id, triple),
-        _ => select_single_component_asset(assets, component, triple),
+        ComponentSelector::Wrapper(wrapper_id) => {
+            select_wrapper_asset_for_targets(assets, wrapper_id, target)
+        }
+        _ => select_single_component_asset_for_targets(assets, component, target),
     }
 }
 
-fn select_single_component_asset<'a>(
+fn select_single_component_asset_for_targets<'a>(
     assets: &'a [GithubAsset],
     component: ComponentSelector<'_>,
-    triple: &str,
+    target: &TargetTripleResolution,
 ) -> Result<&'a GithubAsset, HackArenaError> {
-    let matches = assets
-        .iter()
-        .filter(|a| is_component_asset(&a.name, component, triple))
-        .collect::<Vec<_>>();
-
-    if matches.is_empty() {
-        return Err(no_asset_error(assets, component, triple));
-    }
-    if matches.len() > 1 {
-        let names = matches
+    for triple in &target.triples {
+        let matches = assets
             .iter()
-            .map(|a| a.name.as_str())
-            .collect::<Vec<_>>()
-            .join(", ");
-        return Err(HackArenaError::msg(format!(
-            "Multiple assets matched {} for platform `{triple}`: {}",
-            component_name(component),
-            names
-        )));
-    }
+            .filter(|a| is_component_asset(&a.name, component, triple))
+            .collect::<Vec<_>>();
 
-    Ok(matches[0])
+        if matches.is_empty() {
+            continue;
+        }
+        if matches.len() > 1 {
+            let names = matches
+                .iter()
+                .map(|a| a.name.as_str())
+                .collect::<Vec<_>>()
+                .join(", ");
+            return Err(HackArenaError::msg(format!(
+                "Multiple assets matched {} for platform `{triple}`: {}",
+                component_name(component),
+                names
+            )));
+        }
+        return Ok(matches[0]);
+    }
+    Err(no_asset_error_for_targets(assets, component, target))
 }
 
-fn select_wrapper_asset<'a>(
+fn select_wrapper_asset_for_targets<'a>(
     assets: &'a [GithubAsset],
     wrapper_id: &str,
-    triple: &str,
+    target: &TargetTripleResolution,
 ) -> Result<&'a GithubAsset, HackArenaError> {
     let component = ComponentSelector::Wrapper(wrapper_id);
-    let platform_matches = assets
-        .iter()
-        .filter(|a| is_wrapper_platform_asset(&a.name, wrapper_id, triple))
-        .collect::<Vec<_>>();
-    if platform_matches.len() > 1 {
-        let names = platform_matches
+    for triple in &target.triples {
+        let platform_matches = assets
             .iter()
-            .map(|a| a.name.as_str())
-            .collect::<Vec<_>>()
-            .join(", ");
-        return Err(HackArenaError::msg(format!(
-            "Multiple platform-specific assets matched {} for platform `{triple}`: {}",
-            component_name(component),
-            names
-        )));
-    }
-    if let Some(selected) = platform_matches.first() {
-        return Ok(selected);
+            .filter(|a| is_wrapper_platform_asset(&a.name, wrapper_id, triple))
+            .collect::<Vec<_>>();
+        if platform_matches.len() > 1 {
+            let names = platform_matches
+                .iter()
+                .map(|a| a.name.as_str())
+                .collect::<Vec<_>>()
+                .join(", ");
+            return Err(HackArenaError::msg(format!(
+                "Multiple platform-specific assets matched {} for platform `{triple}`: {}",
+                component_name(component),
+                names
+            )));
+        }
+        if let Some(selected) = platform_matches.first() {
+            return Ok(selected);
+        }
     }
 
     let universal_matches = assets
@@ -631,29 +697,57 @@ fn select_wrapper_asset<'a>(
         return Ok(selected);
     }
 
-    Err(no_asset_error(assets, component, triple))
+    Err(no_asset_error_for_targets(assets, component, target))
 }
 
-fn no_asset_error(
+fn no_asset_error_for_targets(
     assets: &[GithubAsset],
     component: ComponentSelector<'_>,
-    triple: &str,
+    target: &TargetTripleResolution,
 ) -> HackArenaError {
     let available = assets
         .iter()
         .map(|a| a.name.as_str())
         .collect::<Vec<_>>()
         .join(", ");
+    let tried = target.triples.join(", ");
+    let linux_details = target
+        .linux_details
+        .as_ref()
+        .map(|details| {
+            format!(
+                " Linux libc mode: `{}` (source: {}, order: {}).",
+                details.mode.as_str(),
+                details.source,
+                details.order_label
+            )
+        })
+        .unwrap_or_default();
     HackArenaError::msg(format!(
-        "No asset matching {} for platform `{triple}`. Expected pattern: {}. Available assets: {}",
+        "No asset matching {} for tried platform(s) `{tried}`.{} Expected pattern: {}. Available assets: {}",
         component_name(component),
-        expected_pattern(component, triple),
+        linux_details,
+        expected_pattern_for_targets(component, &target.triples),
         if available.is_empty() {
             "<none>".to_string()
         } else {
             available
         }
     ))
+}
+
+fn expected_pattern_for_targets(component: ComponentSelector<'_>, triples: &[&str]) -> String {
+    let mut patterns = Vec::<String>::new();
+    for triple in triples {
+        let pattern = expected_pattern(component, triple);
+        if !patterns.contains(&pattern) {
+            patterns.push(pattern);
+        }
+    }
+    if patterns.is_empty() {
+        return expected_pattern(component, "unknown");
+    }
+    patterns.join(" OR ")
 }
 
 fn is_component_asset(name: &str, component: ComponentSelector<'_>, triple: &str) -> bool {
@@ -778,11 +872,222 @@ fn known_target_triples() -> &'static [&'static str] {
     &[
         "x86_64-pc-windows-msvc",
         "aarch64-pc-windows-msvc",
+        "x86_64-unknown-linux-gnu",
+        "aarch64-unknown-linux-gnu",
         "x86_64-unknown-linux-musl",
         "aarch64-unknown-linux-musl",
         "x86_64-apple-darwin",
         "aarch64-apple-darwin",
     ]
+}
+
+pub fn linux_libc_verbose_summary(
+    linux_libc_override: Option<LinuxLibcMode>,
+) -> Result<Option<String>, HackArenaError> {
+    if !cfg!(target_os = "linux") {
+        return Ok(None);
+    }
+    let target = current_target_triples(linux_libc_override)?;
+    let Some(details) = target.linux_details else {
+        return Ok(None);
+    };
+    Ok(Some(format!(
+        "{} (source: {}, order: {})",
+        details.mode.as_str(),
+        details.source,
+        details.order_label
+    )))
+}
+
+fn current_target_triples(
+    linux_libc_override: Option<LinuxLibcMode>,
+) -> Result<TargetTripleResolution, HackArenaError> {
+    if cfg!(all(target_os = "windows", target_arch = "x86_64")) {
+        return Ok(TargetTripleResolution {
+            triples: vec!["x86_64-pc-windows-msvc"],
+            linux_details: None,
+        });
+    }
+    if cfg!(all(target_os = "windows", target_arch = "aarch64")) {
+        return Ok(TargetTripleResolution {
+            triples: vec!["aarch64-pc-windows-msvc"],
+            linux_details: None,
+        });
+    }
+    if cfg!(all(target_os = "macos", target_arch = "x86_64")) {
+        return Ok(TargetTripleResolution {
+            triples: vec!["x86_64-apple-darwin"],
+            linux_details: None,
+        });
+    }
+    if cfg!(all(target_os = "macos", target_arch = "aarch64")) {
+        return Ok(TargetTripleResolution {
+            triples: vec!["aarch64-apple-darwin"],
+            linux_details: None,
+        });
+    }
+    if cfg!(all(target_os = "linux", target_arch = "x86_64")) {
+        let (triples, details) =
+            linux_target_triples_for_arch("x86_64", resolve_linux_mode(linux_libc_override)?)?;
+        return Ok(TargetTripleResolution {
+            triples,
+            linux_details: Some(details),
+        });
+    }
+    if cfg!(all(target_os = "linux", target_arch = "aarch64")) {
+        let (triples, details) =
+            linux_target_triples_for_arch("aarch64", resolve_linux_mode(linux_libc_override)?)?;
+        return Ok(TargetTripleResolution {
+            triples,
+            linux_details: Some(details),
+        });
+    }
+
+    Err(HackArenaError::msg(
+        "This platform is not supported by GitHub release artifact mapping.",
+    ))
+}
+
+fn linux_target_triples_for_arch(
+    arch: &str,
+    details: LinuxModeDetails,
+) -> Result<(Vec<&'static str>, LinuxModeDetails), HackArenaError> {
+    let (gnu, musl) = match arch {
+        "x86_64" => ("x86_64-unknown-linux-gnu", "x86_64-unknown-linux-musl"),
+        "aarch64" => ("aarch64-unknown-linux-gnu", "aarch64-unknown-linux-musl"),
+        _ => {
+            return Err(HackArenaError::msg(format!(
+                "Linux architecture `{arch}` is not supported by release artifact mapping."
+            )));
+        }
+    };
+
+    let triples = match details.order_label {
+        "gnu->musl" => vec![gnu, musl],
+        "musl->gnu" => vec![musl, gnu],
+        "gnu" => vec![gnu],
+        "musl" => vec![musl],
+        _ => vec![musl, gnu],
+    };
+    Ok((triples, details))
+}
+
+fn resolve_linux_mode(
+    linux_libc_override: Option<LinuxLibcMode>,
+) -> Result<LinuxModeDetails, HackArenaError> {
+    let env_value = linux_libc_env_value()?;
+    let auto_order = auto_linux_libc_order_label();
+    resolve_linux_mode_from_inputs(linux_libc_override, env_value.as_deref(), auto_order)
+}
+
+fn resolve_linux_mode_from_inputs(
+    linux_libc_override: Option<LinuxLibcMode>,
+    env_value: Option<&str>,
+    auto_order_label: &'static str,
+) -> Result<LinuxModeDetails, HackArenaError> {
+    if let Some(mode) = linux_libc_override {
+        let order_label = match mode {
+            LinuxLibcMode::Auto => auto_order_label,
+            LinuxLibcMode::Gnu => "gnu",
+            LinuxLibcMode::Musl => "musl",
+        };
+        return Ok(LinuxModeDetails {
+            mode,
+            source: "flag",
+            order_label,
+        });
+    }
+
+    if let Some(raw) = env_value {
+        let mode = LinuxLibcMode::parse(raw).ok_or_else(|| {
+            HackArenaError::msg(format!(
+                "Invalid {LINUX_LIBC_ENV} value `{raw}`. Expected one of: auto, gnu, musl."
+            ))
+        })?;
+        let order_label = match mode {
+            LinuxLibcMode::Auto => auto_order_label,
+            LinuxLibcMode::Gnu => "gnu",
+            LinuxLibcMode::Musl => "musl",
+        };
+        return Ok(LinuxModeDetails {
+            mode,
+            source: "env",
+            order_label,
+        });
+    }
+
+    Ok(LinuxModeDetails {
+        mode: LinuxLibcMode::Auto,
+        source: "default",
+        order_label: auto_order_label,
+    })
+}
+
+fn linux_libc_env_value() -> Result<Option<String>, HackArenaError> {
+    let Ok(value) = std::env::var(LINUX_LIBC_ENV) else {
+        return Ok(None);
+    };
+    let trimmed = value.trim().to_string();
+    if trimmed.is_empty() {
+        return Ok(None);
+    }
+    Ok(Some(trimmed))
+}
+
+fn auto_linux_libc_order_label() -> &'static str {
+    if os_release_id_is_nixos().unwrap_or(false) {
+        return "musl->gnu";
+    }
+    if let Some(ldd) = read_ldd_version_output() {
+        let lower = ldd.to_ascii_lowercase();
+        if lower.contains("musl") {
+            return "musl->gnu";
+        }
+        if lower.contains("glibc") || lower.contains("gnu libc") {
+            return "gnu->musl";
+        }
+    }
+    "musl->gnu"
+}
+
+fn os_release_id_is_nixos() -> Result<bool, HackArenaError> {
+    let path = Path::new("/etc/os-release");
+    let content = match fs::read_to_string(path) {
+        Ok(content) => content,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(e) => return Err(HackArenaError::io_with_path(path, e)),
+    };
+    for line in content.lines() {
+        let trimmed = line.trim();
+        if !trimmed.starts_with("ID=") {
+            continue;
+        }
+        let value = trimmed
+            .trim_start_matches("ID=")
+            .trim_matches('"')
+            .trim_matches('\'')
+            .trim();
+        return Ok(value.eq_ignore_ascii_case("nixos"));
+    }
+    Ok(false)
+}
+
+fn read_ldd_version_output() -> Option<String> {
+    let output = Command::new("ldd").arg("--version").output().ok()?;
+    if output.stdout.is_empty() && output.stderr.is_empty() {
+        return None;
+    }
+    let mut text = String::new();
+    if !output.stdout.is_empty() {
+        text.push_str(&String::from_utf8_lossy(&output.stdout));
+    }
+    if !output.stderr.is_empty() {
+        if !text.is_empty() {
+            text.push('\n');
+        }
+        text.push_str(&String::from_utf8_lossy(&output.stderr));
+    }
+    Some(text)
 }
 
 fn find_checksum_for_asset(
@@ -840,31 +1145,6 @@ pub fn parse_sha256_sums(content: &str) -> Result<HashMap<String, String>, HackA
     }
 
     Ok(out)
-}
-
-pub fn current_target_triple() -> Result<&'static str, HackArenaError> {
-    if cfg!(all(target_os = "windows", target_arch = "x86_64")) {
-        return Ok("x86_64-pc-windows-msvc");
-    }
-    if cfg!(all(target_os = "windows", target_arch = "aarch64")) {
-        return Ok("aarch64-pc-windows-msvc");
-    }
-    if cfg!(all(target_os = "linux", target_arch = "x86_64")) {
-        return Ok("x86_64-unknown-linux-musl");
-    }
-    if cfg!(all(target_os = "linux", target_arch = "aarch64")) {
-        return Ok("aarch64-unknown-linux-musl");
-    }
-    if cfg!(all(target_os = "macos", target_arch = "x86_64")) {
-        return Ok("x86_64-apple-darwin");
-    }
-    if cfg!(all(target_os = "macos", target_arch = "aarch64")) {
-        return Ok("aarch64-apple-darwin");
-    }
-
-    Err(HackArenaError::msg(
-        "This platform is not supported by GitHub release artifact mapping.",
-    ))
 }
 
 fn infer_bin_name_auth(from_artifact_name: &str) -> String {
@@ -1047,8 +1327,10 @@ fn github_http_status_error(
 #[cfg(test)]
 mod tests {
     use super::{
-        ComponentSelector, GithubAsset, GithubRelease, is_component_asset, parse_sha256_sums,
-        select_component_asset, select_latest_release, wrapper_base_id,
+        ComponentSelector, GithubAsset, GithubRelease, LinuxLibcMode, TargetTripleResolution,
+        is_component_asset, linux_target_triples_for_arch, parse_sha256_sums,
+        resolve_linux_mode_from_inputs, select_component_asset, select_latest_release,
+        wrapper_base_id,
     };
 
     fn asset(name: &str) -> GithubAsset {
@@ -1056,6 +1338,13 @@ mod tests {
             name: name.to_string(),
             url: format!("https://example.test/{name}"),
             browser_download_url: format!("https://example.test/{name}"),
+        }
+    }
+
+    fn target(triples: &[&'static str]) -> TargetTripleResolution {
+        TargetTripleResolution {
+            triples: triples.to_vec(),
+            linux_details: None,
         }
     }
 
@@ -1117,6 +1406,11 @@ bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb *ha3-backend-lo
             "x86_64-unknown-linux-musl"
         ));
         assert!(is_component_asset(
+            "ha3-backend-local-x86_64-unknown-linux-gnu-v0.1.0-beta.1.zip",
+            ComponentSelector::Backend,
+            "x86_64-unknown-linux-gnu"
+        ));
+        assert!(is_component_asset(
             "wrapper-python-v0.1.0b1.zip",
             ComponentSelector::Wrapper("python"),
             "x86_64-unknown-linux-musl"
@@ -1138,7 +1432,7 @@ bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb *ha3-backend-lo
         let selected = select_component_asset(
             &assets,
             ComponentSelector::Wrapper("python"),
-            "x86_64-unknown-linux-musl",
+            &target(&["x86_64-unknown-linux-musl"]),
         )
         .expect("select should pass");
         assert_eq!(
@@ -1154,7 +1448,7 @@ bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb *ha3-backend-lo
         let selected = select_component_asset(
             &assets,
             ComponentSelector::Wrapper("python"),
-            "x86_64-pc-windows-msvc",
+            &target(&["x86_64-pc-windows-msvc"]),
         )
         .expect("select should pass");
         assert_eq!(selected.name, "wrapper-python-v0.1.0b1.zip");
@@ -1170,12 +1464,117 @@ bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb *ha3-backend-lo
         let err = select_component_asset(
             &assets,
             ComponentSelector::Wrapper("python"),
-            "x86_64-pc-windows-msvc",
+            &target(&["x86_64-pc-windows-msvc"]),
         )
         .expect_err("expected conflict");
         assert!(
             err.to_string()
                 .contains("Multiple universal assets matched")
+        );
+    }
+
+    #[test]
+    fn linux_resolver_prefers_first_matching_triple_and_fallbacks() {
+        let assets = vec![
+            asset("ha3-backend-local-x86_64-unknown-linux-gnu-v0.1.0.zip"),
+            asset("ha3-backend-local-x86_64-unknown-linux-musl-v0.1.0.zip"),
+        ];
+
+        let selected = select_component_asset(
+            &assets,
+            ComponentSelector::Backend,
+            &target(&["x86_64-unknown-linux-gnu", "x86_64-unknown-linux-musl"]),
+        )
+        .expect("gnu should be preferred");
+        assert!(selected.name.contains("linux-gnu"));
+
+        let selected = select_component_asset(
+            &assets,
+            ComponentSelector::Backend,
+            &target(&["x86_64-unknown-linux-musl", "x86_64-unknown-linux-gnu"]),
+        )
+        .expect("musl should be preferred");
+        assert!(selected.name.contains("linux-musl"));
+
+        let assets = vec![asset(
+            "ha3-backend-local-x86_64-unknown-linux-musl-v0.1.0.zip",
+        )];
+        let selected = select_component_asset(
+            &assets,
+            ComponentSelector::Backend,
+            &target(&["x86_64-unknown-linux-gnu", "x86_64-unknown-linux-musl"]),
+        )
+        .expect("should fallback to musl");
+        assert!(selected.name.contains("linux-musl"));
+    }
+
+    #[test]
+    fn forced_linux_mode_without_asset_is_hard_fail() {
+        let assets = vec![asset(
+            "ha3-backend-local-x86_64-unknown-linux-musl-v0.1.0.zip",
+        )];
+        let err = select_component_asset(
+            &assets,
+            ComponentSelector::Backend,
+            &target(&["x86_64-unknown-linux-gnu"]),
+        )
+        .expect_err("forced gnu should fail when only musl exists");
+        assert!(err.to_string().contains("x86_64-unknown-linux-gnu"));
+    }
+
+    #[test]
+    fn linux_mode_precedence_flag_env_default() {
+        let from_flag =
+            resolve_linux_mode_from_inputs(Some(LinuxLibcMode::Gnu), Some("musl"), "musl->gnu")
+                .expect("flag mode");
+        assert_eq!(from_flag.mode, LinuxLibcMode::Gnu);
+        assert_eq!(from_flag.source, "flag");
+
+        let from_env =
+            resolve_linux_mode_from_inputs(None, Some("musl"), "gnu->musl").expect("env mode");
+        assert_eq!(from_env.mode, LinuxLibcMode::Musl);
+        assert_eq!(from_env.source, "env");
+
+        let default_mode =
+            resolve_linux_mode_from_inputs(None, None, "musl->gnu").expect("default mode");
+        assert_eq!(default_mode.mode, LinuxLibcMode::Auto);
+        assert_eq!(default_mode.source, "default");
+    }
+
+    #[test]
+    fn linux_mode_invalid_env_is_rejected() {
+        let err = resolve_linux_mode_from_inputs(None, Some("bad"), "musl->gnu")
+            .expect_err("invalid env should fail");
+        assert!(err.to_string().contains("HACKARENA_LINUX_LIBC"));
+    }
+
+    #[test]
+    fn linux_triple_order_for_arch_follows_mode() {
+        let (triples, _details) = linux_target_triples_for_arch(
+            "x86_64",
+            resolve_linux_mode_from_inputs(Some(LinuxLibcMode::Gnu), None, "musl->gnu")
+                .expect("mode"),
+        )
+        .expect("triples");
+        assert_eq!(triples, vec!["x86_64-unknown-linux-gnu"]);
+
+        let (triples, _details) = linux_target_triples_for_arch(
+            "x86_64",
+            resolve_linux_mode_from_inputs(Some(LinuxLibcMode::Musl), None, "gnu->musl")
+                .expect("mode"),
+        )
+        .expect("triples");
+        assert_eq!(triples, vec!["x86_64-unknown-linux-musl"]);
+
+        let (triples, _details) = linux_target_triples_for_arch(
+            "x86_64",
+            resolve_linux_mode_from_inputs(Some(LinuxLibcMode::Auto), None, "gnu->musl")
+                .expect("mode"),
+        )
+        .expect("triples");
+        assert_eq!(
+            triples,
+            vec!["x86_64-unknown-linux-gnu", "x86_64-unknown-linux-musl"]
         );
     }
 
