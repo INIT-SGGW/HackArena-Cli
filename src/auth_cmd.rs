@@ -1,3 +1,4 @@
+use crate::cmd_hint;
 use crate::config::Paths;
 use crate::error::HackArenaError;
 use std::io::ErrorKind;
@@ -41,8 +42,9 @@ pub(crate) fn resolve_auth_binary(paths: &Paths) -> Result<PathBuf, HackArenaErr
     }
 
     Err(HackArenaError::msg(format!(
-        "ha-auth is not installed in {}. Run `hackarena install auth` first.",
-        paths.bin_dir.display()
+        "ha-auth is not installed in {}. Run `{}` first.",
+        paths.bin_dir.display(),
+        cmd_hint::run_cli("install auth")
     )))
 }
 

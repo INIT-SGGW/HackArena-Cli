@@ -1,3 +1,4 @@
+use crate::cmd_hint;
 use crate::config::{
     Paths, is_project_dir, load_project_config, load_project_manifest, project_config_path,
     project_manifest_path, validate_edition,
@@ -19,7 +20,7 @@ pub async fn doctor(
     let cwd = std::env::current_dir().map_err(HackArenaError::Io)?;
     print_header("hackarena doctor");
     println!("Project dir: {}", cwd.display());
-    let Some(project) = load_project_or_warn(&cwd, "hackarena install")? else {
+    let Some(project) = load_project_or_warn(&cwd, "install")? else {
         return Ok(());
     };
     let project_path = project_config_path(&cwd);
@@ -74,7 +75,10 @@ fn load_project_or_warn(
             "not initialized (missing `./.hackarena/project.json`)",
             &project_config_path(cwd),
         );
-        println!("Run `{install_hint}` in this directory.");
+        println!(
+            "Run `{}` in this directory.",
+            cmd_hint::run_cli(install_hint)
+        );
         return Ok(None);
     }
     Ok(Some(load_project_config(cwd)?))
@@ -145,7 +149,7 @@ pub async fn status(
 ) -> Result<(), HackArenaError> {
     let cwd = std::env::current_dir().map_err(HackArenaError::Io)?;
     print_header("hackarena status");
-    let Some(project) = load_project_or_warn(&cwd, "hackarena install")? else {
+    let Some(project) = load_project_or_warn(&cwd, "install")? else {
         return Ok(());
     };
     let config = load_effective_config(paths, &project, no_cache, prerelease).await?;
@@ -213,7 +217,10 @@ pub async fn status(
         .ok()
         .and_then(|(url, _)| auth_version_from_asset_url(url));
     match (current_auth_sha.as_deref(), latest_auth) {
-        (None, _) => println!("auth: unknown (missing local sha256; run `hackarena install auth`)"),
+        (None, _) => println!(
+            "auth: unknown (missing local sha256; run `{}`)",
+            cmd_hint::run_cli("install auth")
+        ),
         (Some(_), Err(_)) => println!("auth: unknown (cannot check latest)"),
         (Some(current), Ok((_url, latest_sha))) => {
             if current.eq_ignore_ascii_case(&latest_sha) {
@@ -227,9 +234,10 @@ pub async fn status(
                 }
             } else {
                 println!(
-                    "auth: update available ({} -> {}; run `hackarena update auth`)",
+                    "auth: update available ({} -> {}; run `{}`)",
                     format_version_opt(current_auth_version.as_deref()),
-                    format_version_opt(latest_auth_version.as_deref())
+                    format_version_opt(latest_auth_version.as_deref()),
+                    cmd_hint::run_cli("update auth")
                 );
             }
         }
@@ -257,7 +265,10 @@ pub async fn status(
             println!("backend: no release yet")
         }
         (None, Ok(None)) => println!("backend: n/a (not configured)"),
-        (None, Ok(Some(_))) => println!("backend: not installed (run `hackarena install backend`)"),
+        (None, Ok(Some(_))) => println!(
+            "backend: not installed (run `{}`)",
+            cmd_hint::run_cli("install backend")
+        ),
         (Some(_), Ok(None)) if github_releases::has_backend_repo(&project.edition) => {
             println!("backend: installed, but no release available now")
         }
@@ -276,9 +287,10 @@ pub async fn status(
                 }
             } else {
                 println!(
-                    "backend: update available ({} -> {}; run `hackarena update backend`)",
+                    "backend: update available ({} -> {}; run `{}`)",
                     format_version_opt(current_backend_version.as_deref()),
-                    format_version_opt(latest_backend_version.as_deref())
+                    format_version_opt(latest_backend_version.as_deref()),
+                    cmd_hint::run_cli("update backend")
                 );
             }
         }
@@ -336,7 +348,8 @@ pub async fn status(
             Ok(Some(latest_bundle)) => {
                 if instances.is_empty() {
                     println!(
-                        "wrapper/{wrapper_id}: not installed (run `hackarena install wrapper {wrapper_id}`)"
+                        "wrapper/{wrapper_id}: not installed (run `{}`)",
+                        cmd_hint::run_cli(&format!("install wrapper {wrapper_id}"))
                     );
                     continue;
                 }
@@ -359,9 +372,10 @@ pub async fn status(
                         }
                     } else {
                         println!(
-                            "wrapper/{instance_id}: update available ({} -> {}; run `hackarena update wrapper {instance_id}`)",
+                            "wrapper/{instance_id}: update available ({} -> {}; run `{}`)",
                             format_version_opt(current_wrapper_version.as_deref()),
-                            format_version_opt(latest_wrapper_version.as_deref())
+                            format_version_opt(latest_wrapper_version.as_deref()),
+                            cmd_hint::run_cli(&format!("update wrapper {instance_id}"))
                         );
                     }
                 }

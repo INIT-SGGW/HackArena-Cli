@@ -1,4 +1,5 @@
 use crate::archive::{ensure_executable, extract_archive, recreate_dir};
+use crate::cmd_hint;
 use crate::config::{
     EditionConfig, Paths, ProjectConfig, ProjectInstalledBinary, ProjectInstalledBundle,
     ProjectManifest, ensure_dir, is_project_dir, load_project_config, load_project_manifest,
@@ -46,7 +47,7 @@ pub async fn install(
     let cwd = std::env::current_dir().map_err(HackArenaError::Io)?;
     if !is_project_dir(&cwd) {
         println!("No `./.hackarena/project.json` found in {}.", cwd.display());
-        println!("Run `hackarena use <edition>` first.");
+        println!("Run `{}` first.", cmd_hint::run_cli("use <edition>"));
         return Ok(());
     }
 
@@ -199,9 +200,10 @@ pub async fn update_auth(
 ) -> Result<(), HackArenaError> {
     let cwd = std::env::current_dir().map_err(HackArenaError::Io)?;
     if !is_project_dir(&cwd) {
-        return Err(HackArenaError::msg(
-            "No `./.hackarena/project.json` found. Run `hackarena install` first.",
-        ));
+        return Err(HackArenaError::msg(format!(
+            "No `./.hackarena/project.json` found. Run `{}` first.",
+            cmd_hint::run_cli("install")
+        )));
     }
 
     let project = load_project_config(&cwd)?;
@@ -235,9 +237,10 @@ pub async fn update_backend(
 ) -> Result<(), HackArenaError> {
     let cwd = std::env::current_dir().map_err(HackArenaError::Io)?;
     if !is_project_dir(&cwd) {
-        return Err(HackArenaError::msg(
-            "No `./.hackarena/project.json` found. Run `hackarena install` first.",
-        ));
+        return Err(HackArenaError::msg(format!(
+            "No `./.hackarena/project.json` found. Run `{}` first.",
+            cmd_hint::run_cli("install")
+        )));
     }
 
     let project = load_project_config(&cwd)?;
@@ -293,9 +296,10 @@ pub async fn install_auth(
 ) -> Result<(), HackArenaError> {
     let cwd = std::env::current_dir().map_err(HackArenaError::Io)?;
     if !is_project_dir(&cwd) {
-        return Err(HackArenaError::msg(
-            "No project found. Run `hackarena use <edition>` in your project first.",
-        ));
+        return Err(HackArenaError::msg(format!(
+            "No project found. Run `{}` in your project first.",
+            cmd_hint::run_cli("use <edition>")
+        )));
     }
     let project = load_project_config(&cwd)?;
     let config = load_effective_config(paths, &project, no_cache, prerelease).await?;
@@ -314,9 +318,10 @@ pub async fn install_backend(
     let project = if is_project_dir(&cwd) {
         load_project_config(&cwd)?
     } else {
-        return Err(HackArenaError::msg(
-            "No project found. Run `hackarena use <edition>` first.",
-        ));
+        return Err(HackArenaError::msg(format!(
+            "No project found. Run `{}` first.",
+            cmd_hint::run_cli("use <edition>")
+        )));
     };
 
     let config = load_effective_config(paths, &project, no_cache, prerelease).await?;
@@ -360,9 +365,10 @@ pub async fn install_wrapper(
     let project = if is_project_dir(&cwd) {
         load_project_config(&cwd)?
     } else {
-        return Err(HackArenaError::msg(
-            "No project found. Run `hackarena use <edition>` first.",
-        ));
+        return Err(HackArenaError::msg(format!(
+            "No project found. Run `{}` first.",
+            cmd_hint::run_cli("use <edition>")
+        )));
     };
 
     let wrappers_root = cwd.join(PROJECT_WRAPPERS_DIR);
@@ -378,7 +384,8 @@ pub async fn install_wrapper(
             let next = next_wrapper_instance_id(&wrappers_root, &managed_wrapper_id);
             if !confirm_install_new_wrapper_instance(&managed_wrapper_id, &next)? {
                 println!(
-                    "Skipped. To install explicitly later, run `hackarena install wrapper {next}`."
+                    "Skipped. To install explicitly later, run `{}`.",
+                    cmd_hint::run_cli(&format!("install wrapper {next}"))
                 );
                 return Ok(());
             }
@@ -455,9 +462,10 @@ pub async fn update_wrapper(
 ) -> Result<(), HackArenaError> {
     let cwd = std::env::current_dir().map_err(HackArenaError::Io)?;
     if !is_project_dir(&cwd) {
-        return Err(HackArenaError::msg(
-            "No `./.hackarena/project.json` found. Run `hackarena install` first.",
-        ));
+        return Err(HackArenaError::msg(format!(
+            "No `./.hackarena/project.json` found. Run `{}` first.",
+            cmd_hint::run_cli("install")
+        )));
     }
     let project = load_project_config(&cwd)?;
     validate_edition(&project.edition)?;
@@ -465,8 +473,9 @@ pub async fn update_wrapper(
     let wrapper_dir = cwd.join(PROJECT_WRAPPERS_DIR).join(wrapper_id);
     if !wrapper_dir.exists() {
         return Err(HackArenaError::msg(format!(
-            "Wrapper `{wrapper_id}` is not installed in {}. Run `hackarena install wrapper {wrapper_id}` first.",
-            wrapper_dir.display()
+            "Wrapper `{wrapper_id}` is not installed in {}. Run `{}` first.",
+            wrapper_dir.display(),
+            cmd_hint::run_cli(&format!("install wrapper {wrapper_id}"))
         )));
     }
 

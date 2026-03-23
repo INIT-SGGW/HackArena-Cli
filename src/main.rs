@@ -2,6 +2,7 @@ mod archive;
 mod auth_cmd;
 mod clean;
 mod cli;
+mod cmd_hint;
 mod config;
 mod constants;
 mod doctor;
