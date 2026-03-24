@@ -1,0 +1,4 @@
+[submodule "third_party/HackArena-Proto"]
+	path = third_party/HackArena-Proto
+	url = https://github.com/INIT-SGGW/HackArena-Proto
+	branch = main
