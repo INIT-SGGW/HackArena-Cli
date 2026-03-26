@@ -299,14 +299,16 @@ fn load_wrapper_manifest(path: &Path) -> Result<WrapperManifest, HackArenaError>
 #[derive(Copy, Clone, Debug)]
 enum WrapperKindMapped {
     Python = 1,
+    Csharp = 2,
 }
 
 fn map_wrapper_kind(language: &str) -> Result<WrapperKindMapped, HackArenaError> {
     let normalized = language.trim().to_ascii_lowercase();
     match normalized.as_str() {
         "python" => Ok(WrapperKindMapped::Python),
+        "csharp" => Ok(WrapperKindMapped::Csharp),
         _ => Err(HackArenaError::msg(format!(
-            "Wrapper language `{language}` is not implemented yet for submit (MVP supports only `python`)."
+            "Wrapper language `{language}` is not implemented yet for submit (supported: `python`, `csharp`)."
         ))),
     }
 }

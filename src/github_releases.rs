@@ -14,8 +14,10 @@ use std::time::{Duration, SystemTime};
 
 const AUTH_REPO: &str = "INIT-SGGW/HackArena-Auth-Cli";
 const BACKEND_REPO_EDITION_3: &str = "INIT-SGGW/HackArena3.0-Backend";
-const WRAPPERS_EDITION_3: &[(&str, &str)] =
-    &[("python", "INIT-SGGW/HackArena3.0-ApiWrapper-Python")];
+const WRAPPERS_EDITION_3: &[(&str, &str)] = &[
+    ("python", "INIT-SGGW/HackArena3.0-ApiWrapper-Python"),
+    ("csharp", "INIT-SGGW/HackArena3.0-ApiWrapper-CSharp"),
+];
 const CHECKSUMS_ASSET_NAME: &str = "SHA256SUMS.txt";
 const RELEASE_CACHE_TTL: Duration = Duration::from_secs(300);
 const LINUX_LIBC_ENV: &str = "HACKARENA_LINUX_LIBC";
@@ -347,6 +349,50 @@ pub async fn wrapper_python_wheel_from_release_tag(
         .map(Some)
 }
 
+pub async fn latest_wrapper_csharp_nupkg_from_releases(
+    paths: &Paths,
+    edition: &str,
+    wrapper_id: &str,
+    no_cache: bool,
+    prerelease: bool,
+    linux_libc_override: Option<LinuxLibcMode>,
+) -> Result<Option<ArtifactSpec>, HackArenaError> {
+    let Some(repo) = wrapper_repo_for_edition(edition, wrapper_id) else {
+        return Ok(None);
+    };
+    let base_id = wrapper_base_id(wrapper_id);
+    let use_cache = !no_cache;
+    let target = current_target_triples(linux_libc_override)?;
+    let Some(release) = latest_release(paths, repo, use_cache, prerelease).await? else {
+        return Ok(None);
+    };
+    resolve_csharp_nupkg_from_release(repo, base_id, &target, &release)
+        .await
+        .map(Some)
+}
+
+pub async fn wrapper_csharp_nupkg_from_release_tag(
+    paths: &Paths,
+    edition: &str,
+    wrapper_id: &str,
+    release_tag: &str,
+    no_cache: bool,
+    linux_libc_override: Option<LinuxLibcMode>,
+) -> Result<Option<ArtifactSpec>, HackArenaError> {
+    let Some(repo) = wrapper_repo_for_edition(edition, wrapper_id) else {
+        return Ok(None);
+    };
+    let base_id = wrapper_base_id(wrapper_id);
+    let use_cache = !no_cache;
+    let target = current_target_triples(linux_libc_override)?;
+    let Some(release) = release_by_tag(paths, repo, release_tag, use_cache).await? else {
+        return Ok(None);
+    };
+    resolve_csharp_nupkg_from_release(repo, base_id, &target, &release)
+        .await
+        .map(Some)
+}
+
 fn wrapper_repo_for_edition(edition: &str, wrapper_id: &str) -> Option<&'static str> {
     let base_id = wrapper_base_id(wrapper_id);
     repos_for_edition(edition).and_then(|repos| {
@@ -468,6 +514,50 @@ async fn resolve_python_wheel_from_release(
     Ok(ArtifactSpec {
         filename: with_asset_name_hint(&wheel_asset.url, &wheel_asset.name),
         sha256: wheel_sha,
+    })
+}
+
+async fn resolve_csharp_nupkg_from_release(
+    repo: &str,
+    wrapper_id: &str,
+    target: &TargetTripleResolution,
+    release: &GithubRelease,
+) -> Result<ArtifactSpec, HackArenaError> {
+    let checksums = fetch_release_checksums(repo, release).await?;
+
+    let wrapper_asset = select_component_asset(
+        &release.assets,
+        ComponentSelector::Wrapper(wrapper_id),
+        target,
+    )?;
+    let wrapper_version = extract_wrapper_version_from_asset_name(&wrapper_asset.name, wrapper_id)
+        .ok_or_else(|| {
+            HackArenaError::msg(format!(
+                "Cannot derive wrapper version from asset `{}` in `{repo}`.",
+                wrapper_asset.name
+            ))
+        })?;
+    let nupkg_name = format!("HackArena3.Wrapper.CSharp.{wrapper_version}.nupkg");
+    let nupkg_asset = release
+        .assets
+        .iter()
+        .find(|a| a.name.eq_ignore_ascii_case(&nupkg_name))
+        .ok_or_else(|| {
+            HackArenaError::msg(format!(
+                "Release `{}` in `{repo}` is missing required runtime package `{nupkg_name}`.",
+                release.tag_name
+            ))
+        })?;
+    let nupkg_sha = find_checksum_for_asset(&checksums, &nupkg_asset.name).ok_or_else(|| {
+        HackArenaError::msg(format!(
+            "Checksum for asset `{}` not found in `{CHECKSUMS_ASSET_NAME}` (repo `{repo}`, release `{}`).",
+            nupkg_asset.name, release.tag_name
+        ))
+    })?;
+
+    Ok(ArtifactSpec {
+        filename: with_asset_name_hint(&nupkg_asset.url, &nupkg_asset.name),
+        sha256: nupkg_sha,
     })
 }
 
@@ -1414,6 +1504,11 @@ bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb *ha3-backend-lo
             "wrapper-python-v0.1.0b1.zip",
             ComponentSelector::Wrapper("python"),
             "x86_64-unknown-linux-musl"
+        ));
+        assert!(is_component_asset(
+            "wrapper-csharp-v0.1.0-beta.1.zip",
+            ComponentSelector::Wrapper("csharp"),
+            "x86_64-pc-windows-msvc"
         ));
         assert!(!is_component_asset(
             "python-wrapper-v0.1.0-x86_64-unknown-linux-musl.zip",

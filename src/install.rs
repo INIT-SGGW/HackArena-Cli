@@ -715,45 +715,122 @@ async fn install_wrapper_to_dir(
             install_dir.display()
         );
     }
+    install_wrapper_runtime(
+        paths,
+        edition,
+        managed_wrapper_id,
+        install_dir,
+        no_cache,
+        prerelease,
+        release_tag,
+        linux_libc,
+    )
+    .await?;
+
+    Ok(())
+}
+
+async fn install_wrapper_runtime(
+    paths: &Paths,
+    edition: &str,
+    managed_wrapper_id: &str,
+    install_dir: &Path,
+    no_cache: bool,
+    prerelease: bool,
+    release_tag: Option<&str>,
+    linux_libc: Option<LinuxLibcMode>,
+) -> Result<(), HackArenaError> {
     if managed_wrapper_id.eq_ignore_ascii_case("python") {
         ensure_python_wrapper_env_api_url(install_dir)?;
+        let wheel_artifact = if let Some(tag) = release_tag {
+            github_releases::wrapper_python_wheel_from_release_tag(
+                paths,
+                edition,
+                managed_wrapper_id,
+                tag,
+                no_cache,
+                linux_libc,
+            )
+            .await?
+        } else {
+            github_releases::latest_wrapper_python_wheel_from_releases(
+                paths,
+                edition,
+                managed_wrapper_id,
+                no_cache,
+                prerelease,
+                linux_libc,
+            )
+            .await?
+        };
+        if let Some(wheel_artifact) = wheel_artifact {
+            let wheel_url = wheel_artifact.filename;
+            let wheel_cache_filename = filename_from_url(&wheel_url)
+                .unwrap_or_else(|| "hackarena3-py3-none-any.whl".to_string());
+            let wheel_cached = download_to_cache(
+                paths,
+                &wheel_url,
+                &wheel_cache_filename,
+                &wheel_artifact.sha256,
+            )
+            .await?;
+            let vendored_req_path = vendor_python_wheel(install_dir, &wheel_cached)?;
+            ensure_python_requirements_has_wheel(install_dir, &vendored_req_path)?;
+            print_python_runtime_hint(&vendored_req_path);
+        }
+        return Ok(());
     }
-    let wheel_artifact = if let Some(tag) = release_tag {
-        github_releases::wrapper_python_wheel_from_release_tag(
+
+    if managed_wrapper_id.eq_ignore_ascii_case("csharp") {
+        let nupkg_artifact = if let Some(tag) = release_tag {
+            github_releases::wrapper_csharp_nupkg_from_release_tag(
+                paths,
+                edition,
+                managed_wrapper_id,
+                tag,
+                no_cache,
+                linux_libc,
+            )
+            .await?
+        } else {
+            github_releases::latest_wrapper_csharp_nupkg_from_releases(
+                paths,
+                edition,
+                managed_wrapper_id,
+                no_cache,
+                prerelease,
+                linux_libc,
+            )
+            .await?
+        };
+        let Some(nupkg_artifact) = nupkg_artifact else {
+            return Err(HackArenaError::msg(format!(
+                "No runtime package release is available yet for wrapper `{managed_wrapper_id}`."
+            )));
+        };
+
+        let nupkg_url = nupkg_artifact.filename;
+        let nupkg_cache_filename = filename_from_url(&nupkg_url)
+            .unwrap_or_else(|| "HackArena3.Wrapper.CSharp.nupkg".to_string());
+        let nupkg_cached = download_to_cache(
             paths,
-            edition,
-            managed_wrapper_id,
-            tag,
-            no_cache,
-            linux_libc,
-        )
-        .await?
-    } else {
-        github_releases::latest_wrapper_python_wheel_from_releases(
-            paths,
-            edition,
-            managed_wrapper_id,
-            no_cache,
-            prerelease,
-            linux_libc,
-        )
-        .await?
-    };
-    if let Some(wheel_artifact) = wheel_artifact {
-        let wheel_url = wheel_artifact.filename;
-        let wheel_cache_filename = filename_from_url(&wheel_url)
-            .unwrap_or_else(|| "hackarena3-py3-none-any.whl".to_string());
-        let wheel_cached = download_to_cache(
-            paths,
-            &wheel_url,
-            &wheel_cache_filename,
-            &wheel_artifact.sha256,
+            &nupkg_url,
+            &nupkg_cache_filename,
+            &nupkg_artifact.sha256,
         )
         .await?;
-        let vendored_req_path = vendor_python_wheel(install_dir, &wheel_cached)?;
-        ensure_python_requirements_has_wheel(install_dir, &vendored_req_path)?;
-        print_python_runtime_hint(&vendored_req_path);
+        let runtime_version =
+            csharp_runtime_version_from_nupkg_url(&nupkg_url).ok_or_else(|| {
+                HackArenaError::msg(format!(
+                    "Cannot derive runtime version from C# package asset `{nupkg_cache_filename}`."
+                ))
+            })?;
+        vendor_csharp_nupkg(install_dir, &nupkg_cached)?;
+        ensure_csharp_nuget_config(install_dir)?;
+        ensure_csharp_bot_csproj_package_reference(install_dir, &runtime_version)?;
+        print_csharp_runtime_hint();
     }
+
     Ok(())
 }
 
@@ -893,6 +970,189 @@ fn vendor_python_wheel(install_dir: &Path, cached_wheel: &Path) -> Result<String
     std::fs::copy(cached_wheel, &vendor_path)
         .map_err(|e| HackArenaError::io_with_path(&vendor_path, e))?;
     Ok(format!("./.vendor/{wheel_name}"))
+}
+
+fn vendor_csharp_nupkg(install_dir: &Path, cached_nupkg: &Path) -> Result<String, HackArenaError> {
+    let nupkg_name = cached_nupkg
+        .file_name()
+        .and_then(|n| n.to_str())
+        .ok_or_else(|| HackArenaError::msg("invalid nupkg filename"))?;
+    let vendor_dir = install_dir.join("user").join(".vendor").join("nuget");
+    ensure_dir(&vendor_dir)?;
+    let vendor_path = vendor_dir.join(nupkg_name);
+    std::fs::copy(cached_nupkg, &vendor_path)
+        .map_err(|e| HackArenaError::io_with_path(&vendor_path, e))?;
+    Ok(format!("./.vendor/nuget/{nupkg_name}"))
+}
+
+fn csharp_runtime_version_from_nupkg_url(url: &str) -> Option<String> {
+    const PREFIX: &str = "HackArena3.Wrapper.CSharp.";
+    const SUFFIX: &str = ".nupkg";
+
+    let filename = filename_from_url(url)?;
+    let lower = filename.to_ascii_lowercase();
+    if !lower.starts_with(&PREFIX.to_ascii_lowercase())
+        || !lower.ends_with(&SUFFIX.to_ascii_lowercase())
+    {
+        return None;
+    }
+    let start = PREFIX.len();
+    let end = filename.len().checked_sub(SUFFIX.len())?;
+    if end <= start {
+        return None;
+    }
+    Some(filename[start..end].to_string())
+}
+
+fn ensure_csharp_nuget_config(install_dir: &Path) -> Result<(), HackArenaError> {
+    const CONFIG_NAME: &str = "NuGet.config";
+    const SOURCE_KEY: &str = "hackarena-local";
+    const SOURCE_VALUE: &str = ".vendor/nuget";
+
+    let config_path = install_dir.join("user").join(CONFIG_NAME);
+    if let Some(parent) = config_path.parent() {
+        ensure_dir(parent)?;
+    }
+
+    let existing = if config_path.is_file() {
+        std::fs::read_to_string(&config_path)
+            .map_err(|e| HackArenaError::io_with_path(&config_path, e))?
+    } else {
+        String::new()
+    };
+    if existing.contains("key=\"hackarena-local\"") || existing.contains("key='hackarena-local'") {
+        return Ok(());
+    }
+
+    let source_line = format!("    <add key=\"{SOURCE_KEY}\" value=\"{SOURCE_VALUE}\" />");
+    let updated = if existing.trim().is_empty() {
+        format!(
+            r#"<?xml version="1.0" encoding="utf-8"?>
+<configuration>
+  <packageSources>
+    <add key="nuget.org" value="https://api.nuget.org/v3/index.json" protocolVersion="3" />
+{source_line}
+  </packageSources>
+</configuration>
+"#
+        )
+    } else if let Some(idx) = existing.find("</packageSources>") {
+        let mut out = existing.clone();
+        let insertion = format!("{source_line}\n");
+        out.insert_str(idx, &insertion);
+        out
+    } else if let Some(idx) = existing.find("</configuration>") {
+        let mut out = existing.clone();
+        let insertion = format!("  <packageSources>\n{source_line}\n  </packageSources>\n");
+        out.insert_str(idx, &insertion);
+        out
+    } else {
+        let mut out = existing.clone();
+        if !out.ends_with('\n') {
+            out.push('\n');
+        }
+        out.push_str(&format!(
+            "<packageSources>\n{source_line}\n</packageSources>\n"
+        ));
+        out
+    };
+
+    std::fs::write(&config_path, updated)
+        .map_err(|e| HackArenaError::io_with_path(&config_path, e))?;
+    Ok(())
+}
+
+fn ensure_csharp_bot_csproj_package_reference(
+    install_dir: &Path,
+    version: &str,
+) -> Result<(), HackArenaError> {
+    const PACKAGE_ID: &str = "HackArena3.Wrapper.CSharp";
+    const START_MARKER: &str = "<!-- hackarena-csharp-runtime: managed by hackarena-cli:start -->";
+    const END_MARKER: &str = "<!-- hackarena-csharp-runtime: managed by hackarena-cli:end -->";
+
+    let csproj_path = install_dir.join("user").join("Bot.csproj");
+    if !csproj_path.is_file() {
+        return Err(HackArenaError::msg(format!(
+            "Wrapper `csharp` requires `user/Bot.csproj` in {}.",
+            install_dir.display()
+        )));
+    }
+    let existing = std::fs::read_to_string(&csproj_path)
+        .map_err(|e| HackArenaError::io_with_path(&csproj_path, e))?;
+
+    let mut filtered = Vec::<String>::new();
+    let mut in_managed_block = false;
+    let mut skip_package_ref_block = false;
+    let package_id_lower = PACKAGE_ID.to_ascii_lowercase();
+    for line in existing.lines() {
+        let trimmed = line.trim();
+        if skip_package_ref_block {
+            if trimmed.to_ascii_lowercase().contains("</packagereference>") {
+                skip_package_ref_block = false;
+            }
+            continue;
+        }
+        if trimmed == START_MARKER {
+            in_managed_block = true;
+            continue;
+        }
+        if trimmed == END_MARKER {
+            in_managed_block = false;
+            continue;
+        }
+        if in_managed_block {
+            continue;
+        }
+        if is_csharp_runtime_package_reference_line(trimmed, &package_id_lower) {
+            if !trimmed.contains("/>") {
+                skip_package_ref_block = true;
+            }
+            continue;
+        }
+        filtered.push(line.to_string());
+    }
+
+    let managed_block = vec![
+        format!("  {START_MARKER}"),
+        "  <ItemGroup>".to_string(),
+        format!("    <PackageReference Include=\"{PACKAGE_ID}\" Version=\"{version}\" />"),
+        "  </ItemGroup>".to_string(),
+        format!("  {END_MARKER}"),
+    ];
+
+    let mut out_lines = Vec::<String>::new();
+    let mut inserted = false;
+    for line in filtered {
+        if !inserted && line.trim() == "</Project>" {
+            out_lines.extend(managed_block.clone());
+            inserted = true;
+        }
+        out_lines.push(line);
+    }
+    if !inserted {
+        if !out_lines.is_empty() && !out_lines.last().is_some_and(|l| l.trim().is_empty()) {
+            out_lines.push(String::new());
+        }
+        out_lines.extend(managed_block);
+    }
+
+    let mut out = out_lines.join("\n");
+    if !out.is_empty() {
+        out.push('\n');
+    }
+    std::fs::write(&csproj_path, out).map_err(|e| HackArenaError::io_with_path(&csproj_path, e))?;
+    Ok(())
+}
+
+fn is_csharp_runtime_package_reference_line(line: &str, package_id_lower: &str) -> bool {
+    let lower = line.to_ascii_lowercase();
+    lower.contains("<packagereference") && lower.contains(package_id_lower)
+}
+
+fn print_csharp_runtime_hint() {
+    println!("Configured C# runtime package (`HackArena3.Wrapper.CSharp`) for local development.");
+    println!("Run from this wrapper directory:");
+    println!("  dotnet run --project user/Bot.csproj");
 }
 
 fn is_hackarena3_requirement_line(line: &str) -> bool {
@@ -1225,8 +1485,10 @@ fn unix_time_seconds() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::{
-        deploy_wrapper_archive, ensure_python_requirements_has_wheel,
-        ensure_python_wrapper_env_api_url, validate_wrapper_install_layout, vendor_python_wheel,
+        csharp_runtime_version_from_nupkg_url, deploy_wrapper_archive,
+        ensure_csharp_bot_csproj_package_reference, ensure_csharp_nuget_config,
+        ensure_python_requirements_has_wheel, ensure_python_wrapper_env_api_url,
+        validate_wrapper_install_layout, vendor_csharp_nupkg, vendor_python_wheel,
     };
     use std::fs;
     use std::io::Write;
@@ -1372,6 +1634,91 @@ mod tests {
         ensure_python_wrapper_env_api_url(&install_dir).expect("no override");
         let content = fs::read_to_string(install_dir.join("user").join(".env")).expect("read env");
         assert_eq!(content, "HA3_WRAPPER_API_URL=http://localhost:8090\n");
+    }
+
+    #[test]
+    fn csharp_runtime_version_is_extracted_from_asset_url() {
+        let url = "https://api.github.com/repos/org/repo/releases/assets/1?asset_name=HackArena3.Wrapper.CSharp.0.1.0-beta.1.nupkg";
+        let version = csharp_runtime_version_from_nupkg_url(url).expect("version");
+        assert_eq!(version, "0.1.0-beta.1");
+    }
+
+    #[test]
+    fn vendor_csharp_nupkg_places_file_in_user_vendor_nuget_dir() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let install_dir = dir.path().join("wrapper");
+        fs::create_dir_all(install_dir.join("user")).expect("user dir");
+
+        let cached = dir
+            .path()
+            .join("HackArena3.Wrapper.CSharp.0.1.0-beta.1.nupkg");
+        fs::write(&cached, b"nupkg-bytes").expect("write cached");
+
+        let rel = vendor_csharp_nupkg(&install_dir, &cached).expect("vendor");
+        assert_eq!(
+            rel,
+            "./.vendor/nuget/HackArena3.Wrapper.CSharp.0.1.0-beta.1.nupkg"
+        );
+        let vendored = install_dir
+            .join("user")
+            .join(".vendor")
+            .join("nuget")
+            .join("HackArena3.Wrapper.CSharp.0.1.0-beta.1.nupkg");
+        assert!(vendored.is_file());
+    }
+
+    #[test]
+    fn ensure_csharp_nuget_config_adds_local_source_idempotently() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let install_dir = dir.path().join("wrapper");
+        fs::create_dir_all(install_dir.join("user")).expect("user dir");
+        let cfg_path = install_dir.join("user").join("NuGet.config");
+        fs::write(
+            &cfg_path,
+            r#"<?xml version="1.0" encoding="utf-8"?>
+<configuration>
+  <packageSources>
+    <add key="nuget.org" value="https://api.nuget.org/v3/index.json" protocolVersion="3" />
+  </packageSources>
+</configuration>
+"#,
+        )
+        .expect("write config");
+
+        ensure_csharp_nuget_config(&install_dir).expect("update config");
+        ensure_csharp_nuget_config(&install_dir).expect("idempotent");
+
+        let content = fs::read_to_string(cfg_path).expect("read config");
+        assert!(content.contains("key=\"hackarena-local\""));
+        assert_eq!(content.matches("key=\"hackarena-local\"").count(), 1);
+    }
+
+    #[test]
+    fn ensure_csharp_bot_csproj_package_reference_adds_and_updates() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let install_dir = dir.path().join("wrapper");
+        fs::create_dir_all(install_dir.join("user")).expect("user dir");
+        let csproj_path = install_dir.join("user").join("Bot.csproj");
+        fs::write(
+            &csproj_path,
+            r#"<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <TargetFramework>net8.0</TargetFramework>
+  </PropertyGroup>
+</Project>
+"#,
+        )
+        .expect("write csproj");
+
+        ensure_csharp_bot_csproj_package_reference(&install_dir, "0.1.0-beta.1")
+            .expect("add package");
+        ensure_csharp_bot_csproj_package_reference(&install_dir, "0.1.0-beta.2")
+            .expect("update package");
+
+        let content = fs::read_to_string(csproj_path).expect("read csproj");
+        assert!(content.contains("HackArena3.Wrapper.CSharp"));
+        assert!(content.contains("Version=\"0.1.0-beta.2\""));
+        assert_eq!(content.matches("HackArena3.Wrapper.CSharp").count(), 1);
     }
 
     #[test]
