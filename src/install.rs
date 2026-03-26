@@ -969,7 +969,7 @@ fn vendor_python_wheel(install_dir: &Path, cached_wheel: &Path) -> Result<String
     let vendor_path = vendor_dir.join(wheel_name);
     std::fs::copy(cached_wheel, &vendor_path)
         .map_err(|e| HackArenaError::io_with_path(&vendor_path, e))?;
-    Ok(format!("./.vendor/{wheel_name}"))
+    Ok(format!("./user/.vendor/{wheel_name}"))
 }
 
 fn vendor_csharp_nupkg(install_dir: &Path, cached_nupkg: &Path) -> Result<String, HackArenaError> {
@@ -1559,7 +1559,7 @@ mod tests {
         )
         .expect("write");
 
-        let wheel = "./.vendor/hackarena3-0.1.0b1-py3-none-any.whl";
+        let wheel = "./user/.vendor/hackarena3-0.1.0b1-py3-none-any.whl";
         ensure_python_requirements_has_wheel(dir.path(), wheel).expect("update req");
         ensure_python_requirements_has_wheel(dir.path(), wheel).expect("idempotent");
 
@@ -1586,7 +1586,7 @@ mod tests {
         fs::write(&cached, b"wheel-bytes").expect("write cached");
 
         let rel = vendor_python_wheel(&install_dir, &cached).expect("vendor");
-        assert_eq!(rel, "./.vendor/hackarena3-0.1.0b1-py3-none-any.whl");
+        assert_eq!(rel, "./user/.vendor/hackarena3-0.1.0b1-py3-none-any.whl");
         let vendored = install_dir
             .join("user")
             .join(".vendor")

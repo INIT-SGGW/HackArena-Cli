@@ -498,7 +498,10 @@ fn is_managed_hackarena3_wheel_line(line: &str) -> bool {
         return false;
     }
     let lower = trimmed.to_ascii_lowercase();
-    if lower.starts_with("./.vendor/hackarena3-") && lower.ends_with(".whl") {
+    if (lower.starts_with("./.vendor/hackarena3-")
+        || lower.starts_with("./user/.vendor/hackarena3-"))
+        && lower.ends_with(".whl")
+    {
         return true;
     }
     (lower.contains("hackarena3.0-apiwrapper-python") && lower.contains("hackarena3-"))
