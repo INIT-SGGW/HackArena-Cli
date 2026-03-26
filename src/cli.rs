@@ -97,6 +97,17 @@ pub enum Command {
         args: Vec<String>,
     },
 
+    /// Submit wrapper solution for remote build.
+    Submit {
+        /// Target submission slot (required for edition `3`).
+        #[arg(long, value_parser = clap::value_parser!(u8).range(1..=3))]
+        slot: Option<u8>,
+
+        /// Optional submission description attached to the build request.
+        #[arg(short = 'd', long)]
+        description: Option<String>,
+    },
+
     /// Remove downloaded/installed artifacts (interactive by default).
     Clean {
         /// Remove everything (project + global Paths dirs).

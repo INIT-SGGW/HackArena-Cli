@@ -10,6 +10,8 @@ mod download;
 mod error;
 mod github_releases;
 mod install;
+mod submission_proto;
+mod submit;
 
 use clap::Parser;
 use cli::{Cli, Command, InstallSubcommand, LinuxLibcArg, UpdateSubcommand};
@@ -155,6 +157,9 @@ impl Command {
                 prerelease,
             } => doctor::status(paths, *no_cache, *prerelease, verbose).await?,
             Command::Auth { args } => auth_cmd::run_auth(paths, args)?,
+            Command::Submit { slot, description } => {
+                submit::submit(paths, *slot, description.as_deref()).await?
+            }
             Command::Clean {
                 all,
                 project,
