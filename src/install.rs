@@ -59,7 +59,17 @@ pub async fn install(
 
     let config = load_effective_config(paths, &project, no_cache, prerelease, linux_libc).await?;
     let installed_wrappers = discover_installed_wrappers(&cwd);
-    let chosen_wrapper = choose_wrapper_id(&project, &config, &installed_wrappers)?;
+    let mut chosen_wrapper = choose_wrapper_id(&project, &config, &installed_wrappers)?;
+    if !skip_wrapper && installed_wrappers.is_empty() && chosen_wrapper.is_none() {
+        chosen_wrapper = choose_wrapper_for_fresh_install(&project.edition, &config)?;
+    }
+    if !skip_wrapper && !installed_wrappers.is_empty() {
+        println!("Installed wrappers: {}", installed_wrappers.join(", "));
+        println!(
+            "Use `{}` to install another wrapper.",
+            cmd_hint::run_cli("install wrapper")
+        );
+    }
     let mut backend_installed_now = false;
     let mut wrapper_installed_now = false;
 
@@ -369,7 +379,7 @@ pub async fn install_backend(
 /// Installs a wrapper by id into `./wrappers/<wrapper_id>` (project-local).
 pub async fn install_wrapper(
     paths: &Paths,
-    wrapper_id: &str,
+    wrapper_id: Option<&str>,
     no_cache: bool,
     prerelease: bool,
     release_tag: Option<&str>,
@@ -385,11 +395,17 @@ pub async fn install_wrapper(
         )));
     };
 
+    let config = load_effective_config(paths, &project, no_cache, prerelease, linux_libc).await?;
+    let requested_wrapper_id = match wrapper_id {
+        Some(id) => id.to_string(),
+        None => choose_wrapper_for_install_command(&project.edition, &config)?,
+    };
+
     let wrappers_root = cwd.join(PROJECT_WRAPPERS_DIR);
     ensure_dir(&wrappers_root)?;
-    let managed_wrapper_id = github_releases::wrapper_base_id(wrapper_id).to_string();
-    let requested_is_base = wrapper_id == managed_wrapper_id;
-    let mut target_wrapper_id = wrapper_id.to_string();
+    let managed_wrapper_id = github_releases::wrapper_base_id(&requested_wrapper_id).to_string();
+    let requested_is_base = requested_wrapper_id == managed_wrapper_id;
+    let mut target_wrapper_id = requested_wrapper_id;
     if requested_is_base {
         let base_dir = wrappers_root.join(&managed_wrapper_id);
         if base_dir.exists()
@@ -407,7 +423,6 @@ pub async fn install_wrapper(
         }
     }
     let wrapper_dir = wrappers_root.join(&target_wrapper_id);
-    let config = load_effective_config(paths, &project, no_cache, prerelease, linux_libc).await?;
     let (wrapper_url, wrapper_sha) = resolve_wrapper_target(
         paths,
         &project,
@@ -1472,6 +1487,129 @@ fn choose_wrapper_id(
         return Ok(None);
     }
     Ok(None)
+}
+
+fn wrapper_choices_for_edition(edition: &str, config: &EditionConfig) -> Vec<(String, bool)> {
+    let mut ids = github_releases::wrapper_ids_for_edition(edition)
+        .into_iter()
+        .map(|id| id.to_string())
+        .collect::<Vec<_>>();
+    if ids.is_empty() {
+        ids = config.wrappers.iter().map(|w| w.id.clone()).collect();
+    }
+    ids.sort();
+    ids.dedup();
+    ids.into_iter()
+        .map(|id| {
+            let available = config
+                .wrapper(github_releases::wrapper_base_id(&id))
+                .is_some();
+            (id, available)
+        })
+        .collect()
+}
+
+fn print_available_wrappers(choices: &[(String, bool)]) {
+    println!("Available wrappers:");
+    for (id, available) in choices {
+        if *available {
+            println!("  - {id}");
+        } else {
+            println!("  - {id} (no release yet)");
+        }
+    }
+}
+
+fn choose_wrapper_for_fresh_install(
+    edition: &str,
+    config: &EditionConfig,
+) -> Result<Option<String>, HackArenaError> {
+    let choices = wrapper_choices_for_edition(edition, config);
+    let installable = choices
+        .iter()
+        .filter(|(_, available)| *available)
+        .map(|(id, _)| id.clone())
+        .collect::<Vec<_>>();
+    if installable.is_empty() {
+        return Ok(None);
+    }
+    if installable.len() == 1 {
+        return Ok(Some(installable[0].clone()));
+    }
+    if !(io::stdin().is_terminal() && io::stdout().is_terminal()) {
+        println!(
+            "Multiple wrappers are available ({}) but interactive selection is unavailable.",
+            installable.join(", ")
+        );
+        println!(
+            "Use `{}` to pick one explicitly.",
+            cmd_hint::run_cli("install wrapper <id>")
+        );
+        return Ok(None);
+    }
+
+    println!("No wrappers installed yet. Choose wrapper to install:");
+    choose_wrapper_from_list(&installable, "Choose wrapper number: ").map(Some)
+}
+
+fn choose_wrapper_for_install_command(
+    edition: &str,
+    config: &EditionConfig,
+) -> Result<String, HackArenaError> {
+    let choices = wrapper_choices_for_edition(edition, config);
+    if choices.is_empty() {
+        return Err(HackArenaError::msg(format!(
+            "No wrappers are configured for edition `{edition}`."
+        )));
+    }
+    print_available_wrappers(&choices);
+
+    let installable = choices
+        .iter()
+        .filter(|(_, available)| *available)
+        .map(|(id, _)| id.clone())
+        .collect::<Vec<_>>();
+    if installable.is_empty() {
+        return Err(HackArenaError::msg(
+            "No wrapper release is available yet on GitHub for this edition.",
+        ));
+    }
+    if installable.len() == 1 {
+        println!("Using wrapper `{}`.", installable[0]);
+        return Ok(installable[0].clone());
+    }
+    if !(io::stdin().is_terminal() && io::stdout().is_terminal()) {
+        return Err(HackArenaError::msg(format!(
+            "Wrapper id is required in non-interactive mode. Installable wrappers: {}.",
+            installable.join(", ")
+        )));
+    }
+
+    println!("Choose wrapper to install:");
+    choose_wrapper_from_list(&installable, "Choose wrapper number: ")
+}
+
+fn choose_wrapper_from_list(options: &[String], prompt: &str) -> Result<String, HackArenaError> {
+    for (idx, id) in options.iter().enumerate() {
+        println!("  {}. {}", idx + 1, id);
+    }
+    print!("{prompt}");
+    io::stdout().flush().map_err(HackArenaError::Io)?;
+
+    let mut input = String::new();
+    io::stdin()
+        .read_line(&mut input)
+        .map_err(HackArenaError::Io)?;
+    let index = input
+        .trim()
+        .parse::<usize>()
+        .map_err(|_| HackArenaError::msg("Invalid wrapper number."))?;
+    if index == 0 || index > options.len() {
+        return Err(HackArenaError::msg(
+            "Selected wrapper number is out of range.",
+        ));
+    }
+    Ok(options[index - 1].clone())
 }
 
 fn unix_time_seconds() -> u64 {

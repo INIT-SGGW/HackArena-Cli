@@ -139,7 +139,7 @@ impl Command {
                 }) => {
                     install::install_wrapper(
                         paths,
-                        wrapper_id,
+                        wrapper_id.as_deref(),
                         *no_cache || *sub_no_cache,
                         *prerelease || *sub_prerelease,
                         tag.as_deref(),

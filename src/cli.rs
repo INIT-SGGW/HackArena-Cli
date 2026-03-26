@@ -158,7 +158,8 @@ pub enum InstallSubcommand {
 
     /// Install a wrapper bundle by id.
     Wrapper {
-        wrapper_id: String,
+        /// Wrapper id (e.g. `python`, `csharp`, `python_1`). If omitted, CLI will show available wrappers.
+        wrapper_id: Option<String>,
 
         /// Do not use cached release metadata (always fetch from network).
         #[arg(long)]
