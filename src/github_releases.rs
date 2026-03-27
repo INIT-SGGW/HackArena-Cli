@@ -18,6 +18,7 @@ const WRAPPERS_EDITION_3: &[(&str, &str)] = &[
     ("python", "INIT-SGGW/HackArena3.0-ApiWrapper-Python"),
     ("csharp", "INIT-SGGW/HackArena3.0-ApiWrapper-CSharp"),
     ("cpp", "INIT-SGGW/HackArena3.0-ApiWrapper-Cpp"),
+    ("typescript", "INIT-SGGW/HackArena3.0-ApiWrapper-TypeScript"),
 ];
 const CHECKSUMS_ASSET_NAME: &str = "SHA256SUMS.txt";
 const RELEASE_CACHE_TTL: Duration = Duration::from_secs(300);
@@ -438,6 +439,50 @@ pub async fn wrapper_cpp_sdk_from_release_tag(
         .map(Some)
 }
 
+pub async fn latest_wrapper_typescript_tgz_from_releases(
+    paths: &Paths,
+    edition: &str,
+    wrapper_id: &str,
+    no_cache: bool,
+    prerelease: bool,
+    linux_libc_override: Option<LinuxLibcMode>,
+) -> Result<Option<ArtifactSpec>, HackArenaError> {
+    let Some(repo) = wrapper_repo_for_edition(edition, wrapper_id) else {
+        return Ok(None);
+    };
+    let base_id = wrapper_base_id(wrapper_id);
+    let use_cache = !no_cache;
+    let target = current_target_triples(linux_libc_override)?;
+    let Some(release) = latest_release(paths, repo, use_cache, prerelease).await? else {
+        return Ok(None);
+    };
+    resolve_typescript_tgz_from_release(repo, base_id, &target, &release)
+        .await
+        .map(Some)
+}
+
+pub async fn wrapper_typescript_tgz_from_release_tag(
+    paths: &Paths,
+    edition: &str,
+    wrapper_id: &str,
+    release_tag: &str,
+    no_cache: bool,
+    linux_libc_override: Option<LinuxLibcMode>,
+) -> Result<Option<ArtifactSpec>, HackArenaError> {
+    let Some(repo) = wrapper_repo_for_edition(edition, wrapper_id) else {
+        return Ok(None);
+    };
+    let base_id = wrapper_base_id(wrapper_id);
+    let use_cache = !no_cache;
+    let target = current_target_triples(linux_libc_override)?;
+    let Some(release) = release_by_tag(paths, repo, release_tag, use_cache).await? else {
+        return Ok(None);
+    };
+    resolve_typescript_tgz_from_release(repo, base_id, &target, &release)
+        .await
+        .map(Some)
+}
+
 fn wrapper_repo_for_edition(edition: &str, wrapper_id: &str) -> Option<&'static str> {
     let base_id = wrapper_base_id(wrapper_id);
     repos_for_edition(edition).and_then(|repos| {
@@ -629,6 +674,30 @@ async fn resolve_cpp_sdk_from_release(
     resolve_cpp_sdk_asset(repo, release, &checksums, &wrapper_version, target)
 }
 
+async fn resolve_typescript_tgz_from_release(
+    repo: &str,
+    wrapper_id: &str,
+    target: &TargetTripleResolution,
+    release: &GithubRelease,
+) -> Result<ArtifactSpec, HackArenaError> {
+    let checksums = fetch_release_checksums(repo, release).await?;
+
+    let wrapper_asset = select_component_asset(
+        &release.assets,
+        ComponentSelector::Wrapper(wrapper_id),
+        target,
+    )?;
+    let wrapper_version = extract_wrapper_version_from_asset_name(&wrapper_asset.name, wrapper_id)
+        .ok_or_else(|| {
+            HackArenaError::msg(format!(
+                "Cannot derive wrapper version from asset `{}` in `{repo}`.",
+                wrapper_asset.name
+            ))
+        })?;
+
+    resolve_typescript_runtime_tgz_asset(repo, release, &checksums, &wrapper_version)
+}
+
 fn resolve_cpp_sdk_asset(
     repo: &str,
     release: &GithubRelease,
@@ -675,6 +744,61 @@ fn resolve_cpp_sdk_asset(
     Ok(ArtifactSpec {
         filename: with_asset_name_hint(&sdk_asset.url, &sdk_asset.name),
         sha256: sdk_sha,
+    })
+}
+
+fn resolve_typescript_runtime_tgz_asset(
+    repo: &str,
+    release: &GithubRelease,
+    checksums: &HashMap<String, String>,
+    wrapper_version: &str,
+) -> Result<ArtifactSpec, HackArenaError> {
+    let runtime_name = format!("hackarena3-wrapper-ts-{wrapper_version}.tgz");
+    let matches = release
+        .assets
+        .iter()
+        .filter(|asset| asset.name.eq_ignore_ascii_case(&runtime_name))
+        .collect::<Vec<_>>();
+    if matches.is_empty() {
+        let available = release
+            .assets
+            .iter()
+            .map(|a| a.name.as_str())
+            .collect::<Vec<_>>()
+            .join(", ");
+        return Err(HackArenaError::msg(format!(
+            "Release `{}` in `{repo}` is missing required TypeScript runtime package `{runtime_name}`. Available assets: {}",
+            release.tag_name,
+            if available.is_empty() {
+                "<none>".to_string()
+            } else {
+                available
+            }
+        )));
+    }
+    if matches.len() > 1 {
+        let names = matches
+            .iter()
+            .map(|a| a.name.as_str())
+            .collect::<Vec<_>>()
+            .join(", ");
+        return Err(HackArenaError::msg(format!(
+            "Release `{}` in `{repo}` has multiple matching TypeScript runtime packages for `{runtime_name}`: {}",
+            release.tag_name, names
+        )));
+    }
+    let runtime_asset = matches[0];
+
+    let runtime_sha = find_checksum_for_asset(checksums, &runtime_asset.name).ok_or_else(|| {
+        HackArenaError::msg(format!(
+            "Checksum for asset `{}` not found in `{CHECKSUMS_ASSET_NAME}` (repo `{repo}`, release `{}`).",
+            runtime_asset.name, release.tag_name
+        ))
+    })?;
+
+    Ok(ArtifactSpec {
+        filename: with_asset_name_hint(&runtime_asset.url, &runtime_asset.name),
+        sha256: runtime_sha,
     })
 }
 
@@ -918,6 +1042,50 @@ fn select_wrapper_asset_for_targets<'a>(
         }
     }
 
+    if wrapper_id.eq_ignore_ascii_case("typescript") {
+        let standard_universal_matches = assets
+            .iter()
+            .filter(|a| is_wrapper_standard_universal_asset(&a.name, wrapper_id))
+            .collect::<Vec<_>>();
+        if standard_universal_matches.len() > 1 {
+            let names = standard_universal_matches
+                .iter()
+                .map(|a| a.name.as_str())
+                .collect::<Vec<_>>()
+                .join(", ");
+            return Err(HackArenaError::msg(format!(
+                "Multiple universal assets matched {}: {}",
+                component_name(component),
+                names
+            )));
+        }
+        if let Some(selected) = standard_universal_matches.first() {
+            return Ok(selected);
+        }
+
+        let custom_universal_matches = assets
+            .iter()
+            .filter(|a| is_typescript_custom_universal_wrapper_asset(&a.name, wrapper_id))
+            .collect::<Vec<_>>();
+        if custom_universal_matches.len() > 1 {
+            let names = custom_universal_matches
+                .iter()
+                .map(|a| a.name.as_str())
+                .collect::<Vec<_>>()
+                .join(", ");
+            return Err(HackArenaError::msg(format!(
+                "Multiple universal assets matched {}: {}",
+                component_name(component),
+                names
+            )));
+        }
+        if let Some(selected) = custom_universal_matches.first() {
+            return Ok(selected);
+        }
+
+        return Err(no_asset_error_for_targets(assets, component, target));
+    }
+
     let universal_matches = assets
         .iter()
         .filter(|a| is_wrapper_universal_asset(&a.name, wrapper_id))
@@ -1016,6 +1184,11 @@ fn expected_pattern(component: ComponentSelector<'_>, triple: &str) -> String {
             format!("*-backend-local-{triple}-v<version>.<zip|tar.gz>")
         }
         ComponentSelector::Wrapper(wrapper_id) => {
+            if wrapper_id.eq_ignore_ascii_case("typescript") {
+                return format!(
+                    "wrapper-typescript-v<version>-{triple}.<zip|tar.gz> OR wrapper-typescript-v<version>.<zip|tar.gz> OR hackarena3-template-ts-v<version>.<zip|tar.gz>"
+                );
+            }
             format!(
                 "wrapper-{wrapper_id}-v<version>-{triple}.<zip|tar.gz> OR wrapper-{wrapper_id}-v<version>.<zip|tar.gz>"
             )
@@ -1057,6 +1230,11 @@ fn is_wrapper_platform_asset(name: &str, wrapper_id: &str, triple: &str) -> bool
 }
 
 fn is_wrapper_universal_asset(name: &str, wrapper_id: &str) -> bool {
+    is_wrapper_standard_universal_asset(name, wrapper_id)
+        || is_typescript_custom_universal_wrapper_asset(name, wrapper_id)
+}
+
+fn is_wrapper_standard_universal_asset(name: &str, wrapper_id: &str) -> bool {
     let name_lower = name.to_ascii_lowercase();
     let prefix = format!("wrapper-{}-v", wrapper_id.to_ascii_lowercase());
     if !name_lower.starts_with(&prefix) || !is_archive_extension(&name_lower) {
@@ -1088,21 +1266,52 @@ fn extract_wrapper_version_from_asset_name(asset_name: &str, wrapper_id: &str) -
     let stem = strip_archive_extension(asset_name)?;
     let prefix = format!("wrapper-{}-v", wrapper_id.to_ascii_lowercase());
     let stem_lower = stem.to_ascii_lowercase();
-    if !stem_lower.starts_with(&prefix) {
-        return None;
-    }
-    let mut version = stem.get(prefix.len()..)?.to_string();
-    if version.is_empty() {
-        return None;
-    }
-    for triple in known_target_triples() {
-        let suffix = format!("-{triple}");
-        if version.to_ascii_lowercase().ends_with(&suffix) {
-            let new_len = version.len().saturating_sub(suffix.len());
-            version.truncate(new_len);
-            break;
+    if stem_lower.starts_with(&prefix) {
+        let mut version = stem.get(prefix.len()..)?.to_string();
+        if version.is_empty() {
+            return None;
         }
+        for triple in known_target_triples() {
+            let suffix = format!("-{triple}");
+            if version.to_ascii_lowercase().ends_with(&suffix) {
+                let new_len = version.len().saturating_sub(suffix.len());
+                version.truncate(new_len);
+                break;
+            }
+        }
+        if version.is_empty() {
+            return None;
+        }
+        return Some(version);
     }
+
+    if wrapper_id.eq_ignore_ascii_case("typescript") {
+        return extract_typescript_custom_template_version(stem);
+    }
+    None
+}
+
+fn is_typescript_custom_universal_wrapper_asset(name: &str, wrapper_id: &str) -> bool {
+    if !wrapper_id.eq_ignore_ascii_case("typescript") {
+        return false;
+    }
+    let name_lower = name.to_ascii_lowercase();
+    if !is_archive_extension(&name_lower) {
+        return false;
+    }
+    let Some(stem) = strip_archive_extension(&name_lower) else {
+        return false;
+    };
+    extract_typescript_custom_template_version(stem).is_some()
+}
+
+fn extract_typescript_custom_template_version(stem: &str) -> Option<String> {
+    let stem_lower = stem.to_ascii_lowercase();
+    let prefix = "hackarena3-template-ts-v";
+    if !stem_lower.starts_with(prefix) {
+        return None;
+    }
+    let version = stem.get(prefix.len()..)?.to_string();
     if version.is_empty() {
         return None;
     }
@@ -1569,8 +1778,9 @@ fn github_http_status_error(
 mod tests {
     use super::{
         ComponentSelector, GithubAsset, GithubRelease, LinuxLibcMode, TargetTripleResolution,
-        cpp_sdk_asset_candidates, is_component_asset, linux_target_triples_for_arch,
-        parse_sha256_sums, resolve_cpp_sdk_asset, resolve_linux_mode_from_inputs,
+        cpp_sdk_asset_candidates, extract_wrapper_version_from_asset_name, is_component_asset,
+        linux_target_triples_for_arch, parse_sha256_sums, resolve_cpp_sdk_asset,
+        resolve_linux_mode_from_inputs, resolve_typescript_runtime_tgz_asset,
         select_component_asset, select_latest_release, wrapper_base_id,
     };
     use std::collections::HashMap;
@@ -1667,6 +1877,16 @@ bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb *ha3-backend-lo
             ComponentSelector::Wrapper("cpp"),
             "x86_64-pc-windows-msvc"
         ));
+        assert!(is_component_asset(
+            "wrapper-typescript-v0.2.0-beta.1.zip",
+            ComponentSelector::Wrapper("typescript"),
+            "x86_64-pc-windows-msvc"
+        ));
+        assert!(is_component_asset(
+            "hackarena3-template-ts-v0.2.0-beta.1.zip",
+            ComponentSelector::Wrapper("typescript"),
+            "x86_64-pc-windows-msvc"
+        ));
         assert!(!is_component_asset(
             "python-wrapper-v0.1.0-x86_64-unknown-linux-musl.zip",
             ComponentSelector::Wrapper("python"),
@@ -1704,6 +1924,110 @@ bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb *ha3-backend-lo
         )
         .expect("select should pass");
         assert_eq!(selected.name, "wrapper-python-v0.1.0b1.zip");
+    }
+
+    #[test]
+    fn typescript_wrapper_asset_selection_accepts_custom_universal_template() {
+        let assets = vec![asset("hackarena3-template-ts-v0.2.0-beta.1.zip")];
+
+        let selected = select_component_asset(
+            &assets,
+            ComponentSelector::Wrapper("typescript"),
+            &target(&["x86_64-pc-windows-msvc"]),
+        )
+        .expect("select should pass");
+        assert_eq!(selected.name, "hackarena3-template-ts-v0.2.0-beta.1.zip");
+    }
+
+    #[test]
+    fn typescript_wrapper_asset_selection_prefers_standard_universal_over_custom() {
+        let assets = vec![
+            asset("hackarena3-template-ts-v0.2.0-beta.1.zip"),
+            asset("wrapper-typescript-v0.2.0-beta.1.zip"),
+        ];
+
+        let selected = select_component_asset(
+            &assets,
+            ComponentSelector::Wrapper("typescript"),
+            &target(&["x86_64-pc-windows-msvc"]),
+        )
+        .expect("select should pass");
+        assert_eq!(selected.name, "wrapper-typescript-v0.2.0-beta.1.zip");
+    }
+
+    #[test]
+    fn extract_wrapper_version_supports_typescript_custom_template() {
+        let version = extract_wrapper_version_from_asset_name(
+            "hackarena3-template-ts-v0.2.0-beta.1.zip",
+            "typescript",
+        )
+        .expect("version");
+        assert_eq!(version, "0.2.0-beta.1");
+    }
+
+    #[test]
+    fn resolve_typescript_runtime_tgz_asset_requires_exact_runtime_and_checksum() {
+        let release = GithubRelease {
+            tag_name: "v0.2.0-beta.1".to_string(),
+            name: "v0.2.0-beta.1".to_string(),
+            draft: false,
+            prerelease: true,
+            assets: vec![asset("hackarena3-wrapper-ts-0.2.0-beta.1.tgz")],
+        };
+        let checksums = HashMap::from([(
+            "hackarena3-wrapper-ts-0.2.0-beta.1.tgz".to_string(),
+            "abc".to_string(),
+        )]);
+
+        let resolved =
+            resolve_typescript_runtime_tgz_asset("org/repo", &release, &checksums, "0.2.0-beta.1")
+                .expect("runtime should resolve");
+        assert!(
+            resolved
+                .filename
+                .contains("hackarena3-wrapper-ts-0.2.0-beta.1.tgz")
+        );
+        assert_eq!(resolved.sha256, "abc");
+    }
+
+    #[test]
+    fn resolve_typescript_runtime_tgz_asset_fails_without_checksum() {
+        let release = GithubRelease {
+            tag_name: "v0.2.0-beta.1".to_string(),
+            name: "v0.2.0-beta.1".to_string(),
+            draft: false,
+            prerelease: true,
+            assets: vec![asset("hackarena3-wrapper-ts-0.2.0-beta.1.tgz")],
+        };
+        let checksums = HashMap::new();
+
+        let err =
+            resolve_typescript_runtime_tgz_asset("org/repo", &release, &checksums, "0.2.0-beta.1")
+                .expect_err("missing checksum should fail");
+        assert!(err.to_string().contains("Checksum for asset"));
+    }
+
+    #[test]
+    fn resolve_typescript_runtime_tgz_asset_fails_for_multiple_matches() {
+        let release = GithubRelease {
+            tag_name: "v0.2.0-beta.1".to_string(),
+            name: "v0.2.0-beta.1".to_string(),
+            draft: false,
+            prerelease: true,
+            assets: vec![
+                asset("hackarena3-wrapper-ts-0.2.0-beta.1.tgz"),
+                asset("HACKARENA3-WRAPPER-TS-0.2.0-BETA.1.TGZ"),
+            ],
+        };
+        let checksums = HashMap::new();
+
+        let err =
+            resolve_typescript_runtime_tgz_asset("org/repo", &release, &checksums, "0.2.0-beta.1")
+                .expect_err("multiple matches should fail");
+        assert!(
+            err.to_string()
+                .contains("multiple matching TypeScript runtime")
+        );
     }
 
     #[test]

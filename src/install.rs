@@ -9,7 +9,7 @@ use crate::constants::{PROJECT_BACKEND_DIR, PROJECT_WRAPPERS_DIR};
 use crate::download::{download_to_cache, sha256_file_hex};
 use crate::error::HackArenaError;
 use crate::github_releases::{self, LinuxLibcMode};
-use std::io::{self, IsTerminal, Write};
+use std::io::{self, IsTerminal, Read, Write};
 use std::path::{Path, PathBuf};
 use tempfile::TempDir;
 
@@ -857,6 +857,48 @@ async fn install_wrapper_runtime(
         return Ok(());
     }
 
+    if managed_wrapper_id.eq_ignore_ascii_case("typescript") {
+        let tgz_artifact = if let Some(tag) = release_tag {
+            github_releases::wrapper_typescript_tgz_from_release_tag(
+                paths,
+                edition,
+                managed_wrapper_id,
+                tag,
+                no_cache,
+                linux_libc,
+            )
+            .await?
+        } else {
+            github_releases::latest_wrapper_typescript_tgz_from_releases(
+                paths,
+                edition,
+                managed_wrapper_id,
+                no_cache,
+                prerelease,
+                linux_libc,
+            )
+            .await?
+        };
+        let Some(tgz_artifact) = tgz_artifact else {
+            return Err(HackArenaError::msg(format!(
+                "No runtime package release is available yet for wrapper `{managed_wrapper_id}`."
+            )));
+        };
+
+        let tgz_url = tgz_artifact.filename;
+        let tgz_cache_filename =
+            filename_from_url(&tgz_url).unwrap_or_else(|| "hackarena3-wrapper-ts.tgz".to_string());
+        println!("Downloading TypeScript runtime...");
+        let tgz_cached =
+            download_to_cache(paths, &tgz_url, &tgz_cache_filename, &tgz_artifact.sha256).await?;
+        println!("Installing TypeScript runtime...");
+        let vendored_rel = vendor_typescript_tgz(install_dir, &tgz_cached)?;
+        let package_name = typescript_runtime_package_name_from_tgz(&tgz_cached)?;
+        ensure_typescript_package_json_dependency(install_dir, &package_name, &vendored_rel)?;
+        print_typescript_runtime_hint();
+        return Ok(());
+    }
+
     if managed_wrapper_id.eq_ignore_ascii_case("cpp") {
         let sdk_artifact = if let Some(tag) = release_tag {
             github_releases::wrapper_cpp_sdk_from_release_tag(
@@ -1049,6 +1091,127 @@ fn vendor_csharp_nupkg(install_dir: &Path, cached_nupkg: &Path) -> Result<String
     std::fs::copy(cached_nupkg, &vendor_path)
         .map_err(|e| HackArenaError::io_with_path(&vendor_path, e))?;
     Ok(format!("./.vendor/nuget/{nupkg_name}"))
+}
+
+fn vendor_typescript_tgz(install_dir: &Path, cached_tgz: &Path) -> Result<String, HackArenaError> {
+    let tgz_name = cached_tgz
+        .file_name()
+        .and_then(|n| n.to_str())
+        .ok_or_else(|| HackArenaError::msg("invalid TypeScript runtime filename"))?;
+    let vendor_dir = install_dir.join("user").join(".vendor");
+    ensure_dir(&vendor_dir)?;
+    let vendor_path = vendor_dir.join(tgz_name);
+    std::fs::copy(cached_tgz, &vendor_path)
+        .map_err(|e| HackArenaError::io_with_path(&vendor_path, e))?;
+    Ok(format!("./.vendor/{tgz_name}"))
+}
+
+fn typescript_runtime_package_name_from_tgz(tgz_path: &Path) -> Result<String, HackArenaError> {
+    let file =
+        std::fs::File::open(tgz_path).map_err(|e| HackArenaError::io_with_path(tgz_path, e))?;
+    let decoder = flate2::read::GzDecoder::new(file);
+    let mut archive = tar::Archive::new(decoder);
+    let entries = archive
+        .entries()
+        .map_err(|e| HackArenaError::io_with_path(tgz_path, e))?;
+
+    for entry in entries {
+        let mut entry = entry.map_err(|e| HackArenaError::io_with_path(tgz_path, e))?;
+        let entry_path = entry
+            .path()
+            .map_err(|e| HackArenaError::io_with_path(tgz_path, e))?;
+        let rel = entry_path.to_string_lossy().replace('\\', "/");
+        if rel != "package/package.json" && rel != "./package/package.json" {
+            continue;
+        }
+
+        let mut content = String::new();
+        entry
+            .read_to_string(&mut content)
+            .map_err(|e| HackArenaError::io_with_path(tgz_path, e))?;
+        let parsed: serde_json::Value = serde_json::from_str(&content).map_err(|e| {
+            HackArenaError::msg(format!(
+                "TypeScript runtime package `{}` has invalid `package/package.json`: {e}",
+                tgz_path.display()
+            ))
+        })?;
+        let Some(name) = parsed.get("name").and_then(|v| v.as_str()) else {
+            return Err(HackArenaError::msg(format!(
+                "TypeScript runtime package `{}` is missing `name` in `package/package.json`.",
+                tgz_path.display()
+            )));
+        };
+        let trimmed = name.trim();
+        if trimmed.is_empty() {
+            return Err(HackArenaError::msg(format!(
+                "TypeScript runtime package `{}` has empty `name` in `package/package.json`.",
+                tgz_path.display()
+            )));
+        }
+        return Ok(trimmed.to_string());
+    }
+
+    Err(HackArenaError::msg(format!(
+        "TypeScript runtime package `{}` is missing `package/package.json`.",
+        tgz_path.display()
+    )))
+}
+
+fn ensure_typescript_package_json_dependency(
+    install_dir: &Path,
+    package_name: &str,
+    vendored_rel: &str,
+) -> Result<(), HackArenaError> {
+    let package_json_path = install_dir.join("user").join("package.json");
+    if !package_json_path.is_file() {
+        return Err(HackArenaError::msg(format!(
+            "Wrapper `typescript` requires `user/package.json` in {}.",
+            install_dir.display()
+        )));
+    }
+
+    let content = std::fs::read_to_string(&package_json_path)
+        .map_err(|e| HackArenaError::io_with_path(&package_json_path, e))?;
+    let mut parsed: serde_json::Value = serde_json::from_str(&content).map_err(|e| {
+        HackArenaError::msg(format!(
+            "Invalid JSON in {}: {}",
+            package_json_path.display(),
+            e
+        ))
+    })?;
+    let Some(root) = parsed.as_object_mut() else {
+        return Err(HackArenaError::msg(format!(
+            "{} must contain a JSON object at root.",
+            package_json_path.display()
+        )));
+    };
+
+    let deps_value = root
+        .entry("dependencies".to_string())
+        .or_insert_with(|| serde_json::Value::Object(serde_json::Map::new()));
+    let Some(dependencies) = deps_value.as_object_mut() else {
+        return Err(HackArenaError::msg(format!(
+            "{} has non-object `dependencies`; cannot patch TypeScript runtime dependency.",
+            package_json_path.display()
+        )));
+    };
+
+    dependencies.insert(
+        package_name.to_string(),
+        serde_json::Value::String(format!("file:{vendored_rel}")),
+    );
+
+    let mut out = serde_json::to_string_pretty(&parsed).map_err(|e| {
+        HackArenaError::msg(format!(
+            "Failed to serialize {} after patching dependencies: {}",
+            package_json_path.display(),
+            e
+        ))
+    })?;
+    out.push('\n');
+    std::fs::write(&package_json_path, out)
+        .map_err(|e| HackArenaError::io_with_path(&package_json_path, e))?;
+    Ok(())
 }
 
 fn vendor_cpp_sdk_archive(
@@ -1324,6 +1487,12 @@ fn print_csharp_runtime_hint() {
     println!("Configured C# runtime package (`HackArena3.Wrapper.CSharp`) for local development.");
     println!("Run from this wrapper directory:");
     println!("  dotnet run --project user/Bot.csproj");
+}
+
+fn print_typescript_runtime_hint() {
+    println!("Configured TypeScript runtime package for local development.");
+    println!("Run from this wrapper directory:");
+    println!("  npm install");
 }
 
 fn ensure_cpp_cmakelists_runtime_include(install_dir: &Path) -> Result<(), HackArenaError> {
@@ -1885,8 +2054,9 @@ mod tests {
         csharp_runtime_version_from_nupkg_url, deploy_wrapper_archive,
         ensure_cpp_cmakelists_runtime_include, ensure_csharp_bot_csproj_package_reference,
         ensure_csharp_nuget_config, ensure_python_requirements_has_wheel,
-        ensure_python_wrapper_env_api_url, validate_wrapper_install_layout, vendor_cpp_sdk_archive,
-        vendor_csharp_nupkg, vendor_python_wheel,
+        ensure_python_wrapper_env_api_url, ensure_typescript_package_json_dependency,
+        typescript_runtime_package_name_from_tgz, validate_wrapper_install_layout,
+        vendor_cpp_sdk_archive, vendor_csharp_nupkg, vendor_python_wheel, vendor_typescript_tgz,
     };
     use flate2::Compression;
     use flate2::write::GzEncoder;
@@ -2154,6 +2324,104 @@ mod tests {
 
         let err = vendor_cpp_sdk_archive(&install_dir, &cached).expect_err("should reject sdk");
         assert!(err.to_string().contains("hackarena3Config.cmake"));
+    }
+
+    #[test]
+    fn typescript_runtime_package_name_is_extracted_from_tgz() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let tgz = dir.path().join("hackarena3-wrapper-ts-0.2.0-beta.1.tgz");
+        create_tar_gz(
+            &tgz,
+            &[(
+                "package/package.json",
+                r#"{"name":"hackarena3-wrapper-ts","version":"0.2.0-beta.1"}"#,
+            )],
+        );
+
+        let name = typescript_runtime_package_name_from_tgz(&tgz).expect("name");
+        assert_eq!(name, "hackarena3-wrapper-ts");
+    }
+
+    #[test]
+    fn vendor_typescript_tgz_places_file_in_user_vendor_dir() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let install_dir = dir.path().join("wrapper");
+        fs::create_dir_all(install_dir.join("user")).expect("user dir");
+
+        let cached = dir.path().join("hackarena3-wrapper-ts-0.2.0-beta.1.tgz");
+        fs::write(&cached, b"tgz-bytes").expect("write cached");
+
+        let rel = vendor_typescript_tgz(&install_dir, &cached).expect("vendor");
+        assert_eq!(rel, "./.vendor/hackarena3-wrapper-ts-0.2.0-beta.1.tgz");
+        let vendored = install_dir
+            .join("user")
+            .join(".vendor")
+            .join("hackarena3-wrapper-ts-0.2.0-beta.1.tgz");
+        assert!(vendored.is_file());
+    }
+
+    #[test]
+    fn ensure_typescript_package_json_dependency_adds_and_updates() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let install_dir = dir.path().join("wrapper");
+        fs::create_dir_all(install_dir.join("user")).expect("user dir");
+        let package_json_path = install_dir.join("user").join("package.json");
+        fs::write(
+            &package_json_path,
+            r#"{
+  "name": "bot-template",
+  "version": "0.1.0",
+  "dependencies": {
+    "axios": "^1.7.0",
+    "hackarena3-wrapper-ts": "file:./.vendor/old.tgz"
+  }
+}
+"#,
+        )
+        .expect("write package.json");
+
+        ensure_typescript_package_json_dependency(
+            &install_dir,
+            "hackarena3-wrapper-ts",
+            "./.vendor/hackarena3-wrapper-ts-0.2.0-beta.1.tgz",
+        )
+        .expect("patch");
+        ensure_typescript_package_json_dependency(
+            &install_dir,
+            "hackarena3-wrapper-ts",
+            "./.vendor/hackarena3-wrapper-ts-0.2.0-beta.1.tgz",
+        )
+        .expect("idempotent");
+
+        let parsed: serde_json::Value = serde_json::from_str(
+            &fs::read_to_string(&package_json_path).expect("read package.json"),
+        )
+        .expect("json parse");
+        assert_eq!(
+            parsed["dependencies"]["hackarena3-wrapper-ts"],
+            serde_json::Value::String(
+                "file:./.vendor/hackarena3-wrapper-ts-0.2.0-beta.1.tgz".to_string()
+            )
+        );
+        assert_eq!(
+            parsed["dependencies"]["axios"],
+            serde_json::Value::String("^1.7.0".to_string())
+        );
+    }
+
+    #[test]
+    fn ensure_typescript_package_json_dependency_requires_package_json() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let install_dir = dir.path().join("wrapper");
+        fs::create_dir_all(install_dir.join("user")).expect("user dir");
+
+        let err = ensure_typescript_package_json_dependency(
+            &install_dir,
+            "hackarena3-wrapper-ts",
+            "./.vendor/hackarena3-wrapper-ts-0.2.0-beta.1.tgz",
+        )
+        .expect_err("should fail");
+        assert!(err.to_string().contains("user/package.json"));
     }
 
     #[test]
