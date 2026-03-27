@@ -300,6 +300,7 @@ fn load_wrapper_manifest(path: &Path) -> Result<WrapperManifest, HackArenaError>
 enum WrapperKindMapped {
     Python = 1,
     Csharp = 2,
+    Cpp = 3,
 }
 
 fn map_wrapper_kind(language: &str) -> Result<WrapperKindMapped, HackArenaError> {
@@ -307,8 +308,9 @@ fn map_wrapper_kind(language: &str) -> Result<WrapperKindMapped, HackArenaError>
     match normalized.as_str() {
         "python" => Ok(WrapperKindMapped::Python),
         "csharp" => Ok(WrapperKindMapped::Csharp),
+        "cpp" => Ok(WrapperKindMapped::Cpp),
         _ => Err(HackArenaError::msg(format!(
-            "Wrapper language `{language}` is not implemented yet for submit (supported: `python`, `csharp`)."
+            "Wrapper language `{language}` is not implemented yet for submit (supported: `python`, `csharp`, `cpp`)."
         ))),
     }
 }
@@ -753,4 +755,15 @@ async fn submit_build(
         submission_id,
         success,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::map_wrapper_kind;
+
+    #[test]
+    fn map_wrapper_kind_supports_cpp() {
+        let kind = map_wrapper_kind("cpp").expect("cpp should be supported");
+        assert_eq!(kind as i32, 3);
+    }
 }

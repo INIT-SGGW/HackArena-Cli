@@ -17,6 +17,7 @@ const BACKEND_REPO_EDITION_3: &str = "INIT-SGGW/HackArena3.0-Backend";
 const WRAPPERS_EDITION_3: &[(&str, &str)] = &[
     ("python", "INIT-SGGW/HackArena3.0-ApiWrapper-Python"),
     ("csharp", "INIT-SGGW/HackArena3.0-ApiWrapper-CSharp"),
+    ("cpp", "INIT-SGGW/HackArena3.0-ApiWrapper-Cpp"),
 ];
 const CHECKSUMS_ASSET_NAME: &str = "SHA256SUMS.txt";
 const RELEASE_CACHE_TTL: Duration = Duration::from_secs(300);
@@ -393,6 +394,50 @@ pub async fn wrapper_csharp_nupkg_from_release_tag(
         .map(Some)
 }
 
+pub async fn latest_wrapper_cpp_sdk_from_releases(
+    paths: &Paths,
+    edition: &str,
+    wrapper_id: &str,
+    no_cache: bool,
+    prerelease: bool,
+    linux_libc_override: Option<LinuxLibcMode>,
+) -> Result<Option<ArtifactSpec>, HackArenaError> {
+    let Some(repo) = wrapper_repo_for_edition(edition, wrapper_id) else {
+        return Ok(None);
+    };
+    let base_id = wrapper_base_id(wrapper_id);
+    let use_cache = !no_cache;
+    let target = current_target_triples(linux_libc_override)?;
+    let Some(release) = latest_release(paths, repo, use_cache, prerelease).await? else {
+        return Ok(None);
+    };
+    resolve_cpp_sdk_from_release(repo, base_id, &target, &release)
+        .await
+        .map(Some)
+}
+
+pub async fn wrapper_cpp_sdk_from_release_tag(
+    paths: &Paths,
+    edition: &str,
+    wrapper_id: &str,
+    release_tag: &str,
+    no_cache: bool,
+    linux_libc_override: Option<LinuxLibcMode>,
+) -> Result<Option<ArtifactSpec>, HackArenaError> {
+    let Some(repo) = wrapper_repo_for_edition(edition, wrapper_id) else {
+        return Ok(None);
+    };
+    let base_id = wrapper_base_id(wrapper_id);
+    let use_cache = !no_cache;
+    let target = current_target_triples(linux_libc_override)?;
+    let Some(release) = release_by_tag(paths, repo, release_tag, use_cache).await? else {
+        return Ok(None);
+    };
+    resolve_cpp_sdk_from_release(repo, base_id, &target, &release)
+        .await
+        .map(Some)
+}
+
 fn wrapper_repo_for_edition(edition: &str, wrapper_id: &str) -> Option<&'static str> {
     let base_id = wrapper_base_id(wrapper_id);
     repos_for_edition(edition).and_then(|repos| {
@@ -559,6 +604,112 @@ async fn resolve_csharp_nupkg_from_release(
         filename: with_asset_name_hint(&nupkg_asset.url, &nupkg_asset.name),
         sha256: nupkg_sha,
     })
+}
+
+async fn resolve_cpp_sdk_from_release(
+    repo: &str,
+    wrapper_id: &str,
+    target: &TargetTripleResolution,
+    release: &GithubRelease,
+) -> Result<ArtifactSpec, HackArenaError> {
+    let checksums = fetch_release_checksums(repo, release).await?;
+
+    let wrapper_asset = select_component_asset(
+        &release.assets,
+        ComponentSelector::Wrapper(wrapper_id),
+        target,
+    )?;
+    let wrapper_version = extract_wrapper_version_from_asset_name(&wrapper_asset.name, wrapper_id)
+        .ok_or_else(|| {
+            HackArenaError::msg(format!(
+                "Cannot derive wrapper version from asset `{}` in `{repo}`.",
+                wrapper_asset.name
+            ))
+        })?;
+    resolve_cpp_sdk_asset(repo, release, &checksums, &wrapper_version, target)
+}
+
+fn resolve_cpp_sdk_asset(
+    repo: &str,
+    release: &GithubRelease,
+    checksums: &HashMap<String, String>,
+    wrapper_version: &str,
+    target: &TargetTripleResolution,
+) -> Result<ArtifactSpec, HackArenaError> {
+    let candidates = cpp_sdk_asset_candidates(wrapper_version, &target.triples);
+    let sdk_asset = candidates.iter().find_map(|candidate| {
+        release
+            .assets
+            .iter()
+            .find(|asset| asset.name.eq_ignore_ascii_case(candidate))
+    });
+    let Some(sdk_asset) = sdk_asset else {
+        let available = release
+            .assets
+            .iter()
+            .map(|a| a.name.as_str())
+            .collect::<Vec<_>>()
+            .join(", ");
+        return Err(HackArenaError::msg(format!(
+            "Release `{}` in `{repo}` is missing required C++ SDK package. Tried: {}. Expected pattern: `hackarena3-cpp-sdk-<version>-<triple>.tar.gz` (legacy Linux generic accepted: `hackarena3-cpp-sdk-<version>-Linux-<arch>.tar.gz`). Available assets: {}",
+            release.tag_name,
+            if candidates.is_empty() {
+                "<none>".to_string()
+            } else {
+                candidates.join(", ")
+            },
+            if available.is_empty() {
+                "<none>".to_string()
+            } else {
+                available
+            }
+        )));
+    };
+    let sdk_sha = find_checksum_for_asset(checksums, &sdk_asset.name).ok_or_else(|| {
+        HackArenaError::msg(format!(
+            "Checksum for asset `{}` not found in `{CHECKSUMS_ASSET_NAME}` (repo `{repo}`, release `{}`).",
+            sdk_asset.name, release.tag_name
+        ))
+    })?;
+
+    Ok(ArtifactSpec {
+        filename: with_asset_name_hint(&sdk_asset.url, &sdk_asset.name),
+        sha256: sdk_sha,
+    })
+}
+
+fn cpp_sdk_asset_candidates(wrapper_version: &str, triples: &[&str]) -> Vec<String> {
+    let mut out = Vec::<String>::new();
+    for triple in triples {
+        let sdk_triple = format!("hackarena3-cpp-sdk-{wrapper_version}-{triple}.tar.gz");
+        push_case_insensitive_unique(&mut out, sdk_triple);
+
+        let legacy = format!("HackArena3.Wrapper.Cpp.{wrapper_version}-{triple}.tar.gz");
+        push_case_insensitive_unique(&mut out, legacy);
+
+        if let Some(arch) = linux_arch_from_triple(triple) {
+            let generic = format!("hackarena3-cpp-sdk-{wrapper_version}-Linux-{arch}.tar.gz");
+            push_case_insensitive_unique(&mut out, generic);
+        }
+    }
+    out
+}
+
+fn push_case_insensitive_unique(items: &mut Vec<String>, candidate: String) {
+    if items
+        .iter()
+        .any(|existing| existing.eq_ignore_ascii_case(&candidate))
+    {
+        return;
+    }
+    items.push(candidate);
+}
+
+fn linux_arch_from_triple(triple: &str) -> Option<&str> {
+    if !triple.contains("-unknown-linux-") {
+        return None;
+    }
+    triple.split_once('-').map(|(arch, _)| arch)
 }
 
 async fn fetch_release_checksums(
@@ -1418,10 +1569,11 @@ fn github_http_status_error(
 mod tests {
     use super::{
         ComponentSelector, GithubAsset, GithubRelease, LinuxLibcMode, TargetTripleResolution,
-        is_component_asset, linux_target_triples_for_arch, parse_sha256_sums,
-        resolve_linux_mode_from_inputs, select_component_asset, select_latest_release,
-        wrapper_base_id,
+        cpp_sdk_asset_candidates, is_component_asset, linux_target_triples_for_arch,
+        parse_sha256_sums, resolve_cpp_sdk_asset, resolve_linux_mode_from_inputs,
+        select_component_asset, select_latest_release, wrapper_base_id,
     };
+    use std::collections::HashMap;
 
     fn asset(name: &str) -> GithubAsset {
         GithubAsset {
@@ -1510,6 +1662,11 @@ bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb *ha3-backend-lo
             ComponentSelector::Wrapper("csharp"),
             "x86_64-pc-windows-msvc"
         ));
+        assert!(is_component_asset(
+            "wrapper-cpp-v0.1.0b8.zip",
+            ComponentSelector::Wrapper("cpp"),
+            "x86_64-pc-windows-msvc"
+        ));
         assert!(!is_component_asset(
             "python-wrapper-v0.1.0-x86_64-unknown-linux-musl.zip",
             ComponentSelector::Wrapper("python"),
@@ -1566,6 +1723,106 @@ bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb *ha3-backend-lo
             err.to_string()
                 .contains("Multiple universal assets matched")
         );
+    }
+
+    #[test]
+    fn cpp_sdk_candidates_follow_target_order_and_include_linux_generic() {
+        let candidates = cpp_sdk_asset_candidates(
+            "0.1.0b8",
+            &["x86_64-unknown-linux-gnu", "x86_64-unknown-linux-musl"],
+        );
+        assert_eq!(
+            candidates,
+            vec![
+                "hackarena3-cpp-sdk-0.1.0b8-x86_64-unknown-linux-gnu.tar.gz",
+                "HackArena3.Wrapper.Cpp.0.1.0b8-x86_64-unknown-linux-gnu.tar.gz",
+                "hackarena3-cpp-sdk-0.1.0b8-Linux-x86_64.tar.gz",
+                "hackarena3-cpp-sdk-0.1.0b8-x86_64-unknown-linux-musl.tar.gz",
+                "HackArena3.Wrapper.Cpp.0.1.0b8-x86_64-unknown-linux-musl.tar.gz",
+            ]
+        );
+    }
+
+    #[test]
+    fn cpp_sdk_resolver_prefers_first_matching_candidate() {
+        let release = GithubRelease {
+            tag_name: "v0.1.0b8".to_string(),
+            name: "v0.1.0b8".to_string(),
+            draft: false,
+            prerelease: true,
+            assets: vec![
+                asset("hackarena3-cpp-sdk-0.1.0b8-Linux-x86_64.tar.gz"),
+                asset("hackarena3-cpp-sdk-0.1.0b8-x86_64-unknown-linux-gnu.tar.gz"),
+            ],
+        };
+        let checksums = HashMap::from([
+            (
+                "hackarena3-cpp-sdk-0.1.0b8-Linux-x86_64.tar.gz".to_string(),
+                "legacy".to_string(),
+            ),
+            (
+                "hackarena3-cpp-sdk-0.1.0b8-x86_64-unknown-linux-gnu.tar.gz".to_string(),
+                "gnu".to_string(),
+            ),
+        ]);
+        let selected = resolve_cpp_sdk_asset(
+            "org/repo",
+            &release,
+            &checksums,
+            "0.1.0b8",
+            &target(&["x86_64-unknown-linux-gnu", "x86_64-unknown-linux-musl"]),
+        )
+        .expect("asset should resolve");
+        assert!(selected.filename.contains("x86_64-unknown-linux-gnu"));
+        assert_eq!(selected.sha256, "gnu");
+    }
+
+    #[test]
+    fn cpp_sdk_resolver_falls_back_to_legacy_linux_generic() {
+        let release = GithubRelease {
+            tag_name: "v0.1.0b8".to_string(),
+            name: "v0.1.0b8".to_string(),
+            draft: false,
+            prerelease: true,
+            assets: vec![asset("hackarena3-cpp-sdk-0.1.0b8-Linux-x86_64.tar.gz")],
+        };
+        let checksums = HashMap::from([(
+            "hackarena3-cpp-sdk-0.1.0b8-Linux-x86_64.tar.gz".to_string(),
+            "legacy".to_string(),
+        )]);
+        let selected = resolve_cpp_sdk_asset(
+            "org/repo",
+            &release,
+            &checksums,
+            "0.1.0b8",
+            &target(&["x86_64-unknown-linux-gnu", "x86_64-unknown-linux-musl"]),
+        )
+        .expect("legacy generic should resolve");
+        assert!(selected.filename.contains("Linux-x86_64"));
+        assert_eq!(selected.sha256, "legacy");
+    }
+
+    #[test]
+    fn cpp_sdk_resolver_fails_when_checksum_missing() {
+        let release = GithubRelease {
+            tag_name: "v0.1.0b8".to_string(),
+            name: "v0.1.0b8".to_string(),
+            draft: false,
+            prerelease: true,
+            assets: vec![asset(
+                "hackarena3-cpp-sdk-0.1.0b8-x86_64-pc-windows-msvc.tar.gz",
+            )],
+        };
+        let checksums = HashMap::new();
+        let err = resolve_cpp_sdk_asset(
+            "org/repo",
+            &release,
+            &checksums,
+            "0.1.0b8",
+            &target(&["x86_64-pc-windows-msvc"]),
+        )
+        .expect_err("missing checksum should fail");
+        assert!(err.to_string().contains("Checksum for asset"));
     }
 
     #[test]

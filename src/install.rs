@@ -634,9 +634,11 @@ async fn install_auth_with_config(
 
     let url = config.auth_artifact.filename.clone();
     let cache_filename = filename_from_url(&url).unwrap_or_else(|| config.bin_name_auth.clone());
+    println!("Downloading auth...");
     let cached =
         download_to_cache(paths, &url, &cache_filename, &config.auth_artifact.sha256).await?;
 
+    println!("Installing auth...");
     if is_archive_path(&cached) {
         let tmp = extract_to_temp_dir(paths, &cached)?;
         let extracted = find_extracted_file(tmp.path(), &config.bin_name_auth)?;
@@ -675,7 +677,9 @@ async fn install_backend_to_dir(
         )));
     }
 
+    println!("Downloading backend...");
     let cached = download_to_cache(paths, &url, &cache_filename, &sha256).await?;
+    println!("Installing backend...");
     recreate_dir(install_dir)?;
     extract_archive(&cached, install_dir)?;
     if force_replace {
@@ -707,8 +711,10 @@ async fn install_wrapper_to_dir(
 
     let cache_filename =
         filename_from_url(wrapper_url).unwrap_or_else(|| "wrapper.zip".to_string());
+    println!("Downloading wrapper `{managed_wrapper_id}`...");
     let cached = download_to_cache(paths, wrapper_url, &cache_filename, wrapper_sha).await?;
 
+    println!("Installing wrapper `{wrapper_instance_id}`...");
     deploy_wrapper_archive(
         wrapper_instance_id,
         &cached,
@@ -782,6 +788,7 @@ async fn install_wrapper_runtime(
             let wheel_url = wheel_artifact.filename;
             let wheel_cache_filename = filename_from_url(&wheel_url)
                 .unwrap_or_else(|| "hackarena3-py3-none-any.whl".to_string());
+            println!("Downloading Python runtime...");
             let wheel_cached = download_to_cache(
                 paths,
                 &wheel_url,
@@ -789,6 +796,7 @@ async fn install_wrapper_runtime(
                 &wheel_artifact.sha256,
             )
             .await?;
+            println!("Installing Python runtime...");
             let vendored_req_path = vendor_python_wheel(install_dir, &wheel_cached)?;
             ensure_python_requirements_has_wheel(install_dir, &vendored_req_path)?;
             print_python_runtime_hint(&vendored_req_path);
@@ -827,6 +835,7 @@ async fn install_wrapper_runtime(
         let nupkg_url = nupkg_artifact.filename;
         let nupkg_cache_filename = filename_from_url(&nupkg_url)
             .unwrap_or_else(|| "HackArena3.Wrapper.CSharp.nupkg".to_string());
+        println!("Downloading C# runtime...");
         let nupkg_cached = download_to_cache(
             paths,
             &nupkg_url,
@@ -840,10 +849,52 @@ async fn install_wrapper_runtime(
                     "Cannot derive runtime version from C# package asset `{nupkg_cache_filename}`."
                 ))
             })?;
+        println!("Installing C# runtime...");
         vendor_csharp_nupkg(install_dir, &nupkg_cached)?;
         ensure_csharp_nuget_config(install_dir)?;
         ensure_csharp_bot_csproj_package_reference(install_dir, &runtime_version)?;
         print_csharp_runtime_hint();
+        return Ok(());
+    }
+
+    if managed_wrapper_id.eq_ignore_ascii_case("cpp") {
+        let sdk_artifact = if let Some(tag) = release_tag {
+            github_releases::wrapper_cpp_sdk_from_release_tag(
+                paths,
+                edition,
+                managed_wrapper_id,
+                tag,
+                no_cache,
+                linux_libc,
+            )
+            .await?
+        } else {
+            github_releases::latest_wrapper_cpp_sdk_from_releases(
+                paths,
+                edition,
+                managed_wrapper_id,
+                no_cache,
+                prerelease,
+                linux_libc,
+            )
+            .await?
+        };
+        let Some(sdk_artifact) = sdk_artifact else {
+            return Err(HackArenaError::msg(format!(
+                "No runtime package release is available yet for wrapper `{managed_wrapper_id}`."
+            )));
+        };
+
+        let sdk_url = sdk_artifact.filename;
+        let sdk_cache_filename =
+            filename_from_url(&sdk_url).unwrap_or_else(|| "hackarena3-cpp-sdk.tar.gz".to_string());
+        println!("Downloading C++ SDK runtime (large package, may take a while)...");
+        let sdk_cached =
+            download_to_cache(paths, &sdk_url, &sdk_cache_filename, &sdk_artifact.sha256).await?;
+        println!("Installing C++ SDK runtime...");
+        vendor_cpp_sdk_archive(install_dir, &sdk_cached)?;
+        ensure_cpp_cmakelists_runtime_include(install_dir)?;
+        print_cpp_runtime_hint();
     }
 
     Ok(())
@@ -998,6 +1049,111 @@ fn vendor_csharp_nupkg(install_dir: &Path, cached_nupkg: &Path) -> Result<String
     std::fs::copy(cached_nupkg, &vendor_path)
         .map_err(|e| HackArenaError::io_with_path(&vendor_path, e))?;
     Ok(format!("./.vendor/nuget/{nupkg_name}"))
+}
+
+fn vendor_cpp_sdk_archive(
+    install_dir: &Path,
+    cached_archive: &Path,
+) -> Result<PathBuf, HackArenaError> {
+    let vendor_dir = install_dir.join("user").join(".vendor").join("cpp");
+    recreate_dir(&vendor_dir)?;
+    extract_archive(cached_archive, &vendor_dir)?;
+
+    let runtime_cmake = vendor_dir.join("hackarena-runtime.cmake");
+    if !runtime_cmake.is_file() {
+        let config_rel = find_hackarena3_config_relative_path(&vendor_dir)?;
+        let generated = generated_cpp_runtime_cmake(&config_rel);
+        std::fs::write(&runtime_cmake, generated)
+            .map_err(|e| HackArenaError::io_with_path(&runtime_cmake, e))?;
+    }
+    Ok(runtime_cmake)
+}
+
+fn find_hackarena3_config_relative_path(vendor_dir: &Path) -> Result<String, HackArenaError> {
+    let mut matches = Vec::<String>::new();
+    let mut stack = vec![vendor_dir.to_path_buf()];
+
+    while let Some(dir) = stack.pop() {
+        let rd = std::fs::read_dir(&dir).map_err(|e| HackArenaError::io_with_path(&dir, e))?;
+        for entry in rd {
+            let entry = entry.map_err(HackArenaError::Io)?;
+            let path = entry.path();
+            let ft = entry
+                .file_type()
+                .map_err(|e| HackArenaError::io_with_path(&path, e))?;
+            if ft.is_dir() {
+                stack.push(path);
+                continue;
+            }
+            if !ft.is_file() {
+                continue;
+            }
+            let is_config = path
+                .file_name()
+                .and_then(|n| n.to_str())
+                .is_some_and(|n| n.eq_ignore_ascii_case("hackarena3Config.cmake"));
+            if !is_config {
+                continue;
+            }
+            let rel = path
+                .strip_prefix(vendor_dir)
+                .map_err(|_| {
+                    HackArenaError::msg(format!(
+                        "Failed to compute relative path for `{}`.",
+                        path.display()
+                    ))
+                })?
+                .to_string_lossy()
+                .replace('\\', "/");
+            matches.push(rel);
+        }
+    }
+
+    matches.sort();
+    matches.dedup();
+
+    if matches.is_empty() {
+        return Err(HackArenaError::msg(format!(
+            "C++ SDK package is invalid: missing `hackarena-runtime.cmake` and `hackarena3Config.cmake` in {}.",
+            vendor_dir.display()
+        )));
+    }
+    if matches.len() > 1 {
+        return Err(HackArenaError::msg(format!(
+            "C++ SDK package is ambiguous: multiple `hackarena3Config.cmake` files found in {}: {}",
+            vendor_dir.display(),
+            matches.join(", ")
+        )));
+    }
+    Ok(matches[0].clone())
+}
+
+fn generated_cpp_runtime_cmake(config_rel_path: &str) -> String {
+    format!(
+        concat!(
+            "# Auto-generated by hackarena-cli.\n",
+            "include_guard(GLOBAL)\n\n",
+            "set(_HA3_RUNTIME_ROOT \"${{CMAKE_CURRENT_LIST_DIR}}\")\n",
+            "set(_HA3_CONFIG_PATH \"${{_HA3_RUNTIME_ROOT}}/{config_rel_path}\")\n\n",
+            "if(NOT EXISTS \"${{_HA3_CONFIG_PATH}}\")\n",
+            "    message(FATAL_ERROR \"HackArena C++ SDK config not found at `${{_HA3_CONFIG_PATH}}`.\")\n",
+            "endif()\n\n",
+            "include(\"${{_HA3_CONFIG_PATH}}\")\n\n",
+            "function(hackarena_use_runtime target_name)\n",
+            "    if(NOT TARGET \"${{target_name}}\")\n",
+            "        message(FATAL_ERROR \"Target `${{target_name}}` does not exist.\")\n",
+            "    endif()\n",
+            "    if(NOT TARGET hackarena3::hackarena3)\n",
+            "        message(FATAL_ERROR \"Target `hackarena3::hackarena3` is missing after loading `${{_HA3_CONFIG_PATH}}`.\")\n",
+            "    endif()\n",
+            "    target_link_libraries(\"${{target_name}}\" PRIVATE hackarena3::hackarena3)\n",
+            "    if(COMMAND hackarena3_copy_runtime_dlls)\n",
+            "        hackarena3_copy_runtime_dlls(\"${{target_name}}\")\n",
+            "    endif()\n",
+            "endfunction()\n"
+        ),
+        config_rel_path = config_rel_path
+    )
 }
 
 fn csharp_runtime_version_from_nupkg_url(url: &str) -> Option<String> {
@@ -1168,6 +1324,109 @@ fn print_csharp_runtime_hint() {
     println!("Configured C# runtime package (`HackArena3.Wrapper.CSharp`) for local development.");
     println!("Run from this wrapper directory:");
     println!("  dotnet run --project user/Bot.csproj");
+}
+
+fn ensure_cpp_cmakelists_runtime_include(install_dir: &Path) -> Result<(), HackArenaError> {
+    const START_MARKER: &str = "# hackarena-cpp-runtime: managed by hackarena-cli:start";
+    const END_MARKER: &str = "# hackarena-cpp-runtime: managed by hackarena-cli:end";
+    const MSVC_ONLY_CHECK_START: &str = "if(WIN32 AND NOT MSVC)";
+    const MSVC_ONLY_CHECK_BODY: &str = "    message(FATAL_ERROR \"HackArena C++ wrapper on Windows supports only MSVC (Visual Studio/cl.exe). MinGW/GCC is not supported.\")";
+    const MSVC_ONLY_CHECK_END: &str = "endif()";
+    const INCLUDE_LINE: &str =
+        "include(\"${CMAKE_CURRENT_LIST_DIR}/.vendor/cpp/hackarena-runtime.cmake\")";
+    const LEGACY_ARTIFACTS_LINE: &str = "set(HACKARENA3_ARTIFACTS_DIR";
+    const FIND_PACKAGE_LINE: &str = "find_package(hackarena3 CONFIG REQUIRED)";
+
+    let cmake_path = install_dir.join("user").join("CMakeLists.txt");
+    if !cmake_path.is_file() {
+        return Err(HackArenaError::msg(format!(
+            "Wrapper `cpp` requires `user/CMakeLists.txt` in {}.",
+            install_dir.display()
+        )));
+    }
+    let existing = std::fs::read_to_string(&cmake_path)
+        .map_err(|e| HackArenaError::io_with_path(&cmake_path, e))?;
+
+    let mut filtered = Vec::<String>::new();
+    let mut in_managed_block = false;
+    let mut insert_before_idx = None;
+    for line in existing.lines() {
+        let trimmed = line.trim();
+        if trimmed == START_MARKER {
+            in_managed_block = true;
+            continue;
+        }
+        if trimmed == END_MARKER {
+            in_managed_block = false;
+            continue;
+        }
+        if in_managed_block {
+            continue;
+        }
+        if trimmed == INCLUDE_LINE {
+            continue;
+        }
+        if insert_before_idx.is_none() && trimmed.starts_with(LEGACY_ARTIFACTS_LINE) {
+            insert_before_idx = Some(filtered.len());
+        }
+        filtered.push(line.to_string());
+    }
+
+    let mut normalized = Vec::<String>::new();
+    let mut idx = 0usize;
+    while idx < filtered.len() {
+        let trimmed = filtered[idx].trim();
+        if trimmed == FIND_PACKAGE_LINE {
+            normalized.push("if(NOT TARGET hackarena3::hackarena3)".to_string());
+            normalized.push("    find_package(hackarena3 CONFIG REQUIRED)".to_string());
+            normalized.push("endif()".to_string());
+            idx += 1;
+            continue;
+        }
+        normalized.push(filtered[idx].clone());
+        idx += 1;
+    }
+
+    let insert_at = insert_before_idx.unwrap_or(0).min(normalized.len());
+    let managed_block = vec![
+        START_MARKER.to_string(),
+        MSVC_ONLY_CHECK_START.to_string(),
+        MSVC_ONLY_CHECK_BODY.to_string(),
+        MSVC_ONLY_CHECK_END.to_string(),
+        INCLUDE_LINE.to_string(),
+        END_MARKER.to_string(),
+        String::new(),
+    ];
+
+    let mut out_lines = Vec::<String>::new();
+    out_lines.extend(normalized[..insert_at].iter().cloned());
+    out_lines.extend(managed_block);
+    out_lines.extend(normalized[insert_at..].iter().cloned());
+
+    while out_lines.last().is_some_and(|line| line.trim().is_empty()) {
+        out_lines.pop();
+    }
+    let mut out = out_lines.join("\n");
+    if !out.is_empty() {
+        out.push('\n');
+    }
+    std::fs::write(&cmake_path, out).map_err(|e| HackArenaError::io_with_path(&cmake_path, e))?;
+    Ok(())
+}
+
+fn print_cpp_runtime_hint() {
+    println!("Configured C++ SDK runtime for local development.");
+    println!("Run from this wrapper directory:");
+    if cfg!(target_os = "windows") {
+        println!("  cmake -S user -B user/build -G \"Visual Studio 17 2022\" -A x64");
+        println!("  cmake --build user/build --config Release");
+        println!(
+            "Windows: only MSVC is supported (Visual Studio/cl.exe). MinGW/GCC is not supported."
+        );
+    } else {
+        println!("  cmake -S user -B user/build -DCMAKE_BUILD_TYPE=Release");
+        println!("  cmake --build user/build");
+    }
 }
 
 fn is_hackarena3_requirement_line(line: &str) -> bool {
@@ -1624,13 +1883,17 @@ fn unix_time_seconds() -> u64 {
 mod tests {
     use super::{
         csharp_runtime_version_from_nupkg_url, deploy_wrapper_archive,
-        ensure_csharp_bot_csproj_package_reference, ensure_csharp_nuget_config,
-        ensure_python_requirements_has_wheel, ensure_python_wrapper_env_api_url,
-        validate_wrapper_install_layout, vendor_csharp_nupkg, vendor_python_wheel,
+        ensure_cpp_cmakelists_runtime_include, ensure_csharp_bot_csproj_package_reference,
+        ensure_csharp_nuget_config, ensure_python_requirements_has_wheel,
+        ensure_python_wrapper_env_api_url, validate_wrapper_install_layout, vendor_cpp_sdk_archive,
+        vendor_csharp_nupkg, vendor_python_wheel,
     };
+    use flate2::Compression;
+    use flate2::write::GzEncoder;
     use std::fs;
     use std::io::Write;
     use std::path::Path;
+    use tar::Builder;
     use zip::write::SimpleFileOptions;
 
     fn create_wrapper_zip(path: &Path, entries: &[(&str, &str)]) {
@@ -1643,6 +1906,23 @@ mod tests {
             zip.write_all(content.as_bytes()).expect("write file");
         }
         zip.finish().expect("finish zip");
+    }
+
+    fn create_tar_gz(path: &Path, entries: &[(&str, &str)]) {
+        let file = fs::File::create(path).expect("create tar.gz");
+        let encoder = GzEncoder::new(file, Compression::default());
+        let mut tar = Builder::new(encoder);
+        for (name, content) in entries {
+            let bytes = content.as_bytes();
+            let mut header = tar::Header::new_gnu();
+            header.set_size(bytes.len() as u64);
+            header.set_mode(0o644);
+            header.set_cksum();
+            tar.append_data(&mut header, *name, bytes)
+                .expect("append file");
+        }
+        let encoder = tar.into_inner().expect("finish tar");
+        encoder.finish().expect("finish gzip");
     }
 
     #[test]
@@ -1806,6 +2086,77 @@ mod tests {
     }
 
     #[test]
+    fn vendor_cpp_sdk_archive_extracts_into_user_vendor_cpp() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let install_dir = dir.path().join("wrapper");
+        fs::create_dir_all(install_dir.join("user")).expect("user dir");
+
+        let cached = dir
+            .path()
+            .join("hackarena3-cpp-sdk-0.1.0b8-x86_64-pc-windows-msvc.tar.gz");
+        create_tar_gz(
+            &cached,
+            &[
+                ("hackarena-runtime.cmake", "set(HA_RUNTIME 1)\n"),
+                (
+                    "lib/cmake/hackarena3/hackarena3Config.cmake",
+                    "set(HA_CFG 1)\n",
+                ),
+            ],
+        );
+
+        let runtime_path = vendor_cpp_sdk_archive(&install_dir, &cached).expect("vendor");
+        assert_eq!(
+            runtime_path,
+            install_dir
+                .join("user")
+                .join(".vendor")
+                .join("cpp")
+                .join("hackarena-runtime.cmake")
+        );
+        assert!(runtime_path.is_file());
+    }
+
+    #[test]
+    fn vendor_cpp_sdk_archive_generates_runtime_when_missing() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let install_dir = dir.path().join("wrapper");
+        fs::create_dir_all(install_dir.join("user")).expect("user dir");
+
+        let cached = dir
+            .path()
+            .join("hackarena3-cpp-sdk-0.1.0b8-x86_64-pc-windows-msvc.tar.gz");
+        create_tar_gz(
+            &cached,
+            &[(
+                "hackarena3-cpp-sdk-0.1.0b8-x86_64-pc-windows-msvc/lib/cmake/hackarena3/hackarena3Config.cmake",
+                "set(HA_CFG 1)\n",
+            )],
+        );
+
+        let runtime_path = vendor_cpp_sdk_archive(&install_dir, &cached).expect("should generate");
+        assert!(runtime_path.is_file());
+        let content = fs::read_to_string(runtime_path).expect("runtime content");
+        assert!(content.contains("Auto-generated by hackarena-cli."));
+        assert!(content.contains("hackarena3-cpp-sdk-0.1.0b8-x86_64-pc-windows-msvc/lib/cmake/hackarena3/hackarena3Config.cmake"));
+    }
+
+    #[test]
+    fn vendor_cpp_sdk_archive_fails_when_runtime_and_config_missing() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let install_dir = dir.path().join("wrapper");
+        fs::create_dir_all(install_dir.join("user")).expect("user dir");
+
+        let cached = dir
+            .path()
+            .join("hackarena3-cpp-sdk-0.1.0b8-x86_64-pc-windows-msvc.tar.gz");
+        create_tar_gz(&cached, &[("README.md", "no runtime and no config\n")]);
+
+        let err = vendor_cpp_sdk_archive(&install_dir, &cached).expect_err("should reject sdk");
+        assert!(err.to_string().contains("hackarena3Config.cmake"));
+    }
+
+    #[test]
     fn ensure_csharp_nuget_config_adds_local_source_idempotently() {
         let dir = tempfile::tempdir().expect("temp dir");
         let install_dir = dir.path().join("wrapper");
@@ -1857,6 +2208,72 @@ mod tests {
         assert!(content.contains("HackArena3.Wrapper.CSharp"));
         assert!(content.contains("Version=\"0.1.0-beta.2\""));
         assert_eq!(content.matches("HackArena3.Wrapper.CSharp").count(), 1);
+    }
+
+    #[test]
+    fn ensure_cpp_cmakelists_runtime_include_is_idempotent_and_guards_find_package() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let install_dir = dir.path().join("wrapper");
+        fs::create_dir_all(install_dir.join("user")).expect("user dir");
+        let cmake_path = install_dir.join("user").join("CMakeLists.txt");
+        fs::write(
+            &cmake_path,
+            r#"cmake_minimum_required(VERSION 3.24)
+project(hackarena3_cpp_template LANGUAGES CXX)
+
+set(HACKARENA3_ARTIFACTS_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../../artifacts")
+find_package(hackarena3 CONFIG REQUIRED)
+
+add_executable(bot src/main.cpp)
+target_link_libraries(bot PRIVATE hackarena3::hackarena3)
+"#,
+        )
+        .expect("write cmake");
+
+        ensure_cpp_cmakelists_runtime_include(&install_dir).expect("first patch");
+        ensure_cpp_cmakelists_runtime_include(&install_dir).expect("idempotent patch");
+
+        let content = fs::read_to_string(cmake_path).expect("read cmake");
+        assert_eq!(
+            content
+                .matches("# hackarena-cpp-runtime: managed by hackarena-cli:start")
+                .count(),
+            1
+        );
+        assert_eq!(
+            content
+                .matches(
+                    "include(\"${CMAKE_CURRENT_LIST_DIR}/.vendor/cpp/hackarena-runtime.cmake\")"
+                )
+                .count(),
+            1
+        );
+        assert_eq!(content.matches("if(WIN32 AND NOT MSVC)").count(), 1);
+        assert!(
+            content.contains(
+                "HackArena C++ wrapper on Windows supports only MSVC (Visual Studio/cl.exe). MinGW/GCC is not supported."
+            )
+        );
+        assert!(content.contains("if(NOT TARGET hackarena3::hackarena3)"));
+        assert!(content.contains("    find_package(hackarena3 CONFIG REQUIRED)"));
+        let include_pos = content
+            .find("include(\"${CMAKE_CURRENT_LIST_DIR}/.vendor/cpp/hackarena-runtime.cmake\")")
+            .expect("include pos");
+        let legacy_pos = content
+            .find("set(HACKARENA3_ARTIFACTS_DIR")
+            .expect("legacy pos");
+        assert!(include_pos < legacy_pos);
+    }
+
+    #[test]
+    fn ensure_cpp_cmakelists_runtime_include_requires_user_cmakelists() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let install_dir = dir.path().join("wrapper");
+        fs::create_dir_all(install_dir.join("user")).expect("user dir");
+
+        let err = ensure_cpp_cmakelists_runtime_include(&install_dir)
+            .expect_err("missing CMakeLists should fail");
+        assert!(err.to_string().contains("user/CMakeLists.txt"));
     }
 
     #[test]

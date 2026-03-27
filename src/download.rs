@@ -2,12 +2,13 @@ use crate::config::{Paths, ensure_dir};
 use crate::error::HackArenaError;
 use futures_util::StreamExt;
 use sha2::{Digest, Sha256};
+use std::io::Read;
 use std::path::{Path, PathBuf};
 use tokio::io::AsyncWriteExt;
 
 /// Downloads an artifact into the downloads cache directory and returns the cached file path.
 ///
-/// If `expected_sha256_hex` is provided, the downloaded bytes are verified.
+/// Reuses an existing cached file when its SHA-256 matches `expected_sha256_hex`.
 pub async fn download_to_cache(
     paths: &Paths,
     url: &str,
@@ -19,6 +20,17 @@ pub async fn download_to_cache(
 
     let cache_path = cache_dir.join(cache_filename);
     let tmp_path = cache_dir.join(format!("{cache_filename}.partial"));
+
+    if cache_path.is_file() {
+        let cached_sha = sha256_file_hex(&cache_path)?;
+        if eq_hex_sha256(expected_sha256_hex, &cached_sha) {
+            println!("Using cached `{cache_filename}`.");
+            return Ok(cache_path);
+        }
+        tokio::fs::remove_file(&cache_path)
+            .await
+            .map_err(|e| HackArenaError::io_with_path(&cache_path, e))?;
+    }
 
     let client = reqwest::Client::new();
     for attempt in 1..=2 {
@@ -96,9 +108,18 @@ pub async fn download_to_cache(
 
 /// Computes SHA-256 of a file on disk, returning lowercase hex.
 pub fn sha256_file_hex(path: &Path) -> Result<String, HackArenaError> {
-    let bytes = std::fs::read(path).map_err(|e| HackArenaError::io_with_path(path, e))?;
+    let mut file = std::fs::File::open(path).map_err(|e| HackArenaError::io_with_path(path, e))?;
+    let mut buffer = [0u8; 64 * 1024];
     let mut hasher = Sha256::new();
-    hasher.update(bytes);
+    loop {
+        let read = file
+            .read(&mut buffer)
+            .map_err(|e| HackArenaError::io_with_path(path, e))?;
+        if read == 0 {
+            break;
+        }
+        hasher.update(&buffer[..read]);
+    }
     Ok(hex::encode(hasher.finalize()))
 }
 
