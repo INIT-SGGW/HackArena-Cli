@@ -57,6 +57,9 @@ pub async fn submit(
             selected.id
         ))
     })?;
+    if wrapper_kind == WrapperKindMapped::Typescript {
+        validate_typescript_wrapper_version(&selected.id, &wrapper_version)?;
+    }
     let submit = manifest.submit.ok_or_else(|| {
         HackArenaError::msg(format!(
             "Wrapper `{}` manifest is missing `[submit]` section.",
@@ -83,13 +86,16 @@ pub async fn submit(
     }
 
     let files = collect_submission_files(&selected.dir, &include, &exclude)?;
+    if wrapper_kind == WrapperKindMapped::Typescript {
+        validate_typescript_submit_entries(&selected.id, &files)?;
+    }
     if files.is_empty() {
         return Err(HackArenaError::msg(format!(
             "Wrapper `{}` submit archive is empty after applying include/exclude rules.",
             selected.id
         )));
     }
-    let archive = build_tar_gz(&files)?;
+    let archive = build_tar_gz(&files, wrapper_kind == WrapperKindMapped::Typescript)?;
 
     let token = fetch_jwt(paths)?;
     let api_url = resolve_api_url(&selected.dir)?;
@@ -296,11 +302,12 @@ fn load_wrapper_manifest(path: &Path) -> Result<WrapperManifest, HackArenaError>
     })
 }
 
-#[derive(Copy, Clone, Debug)]
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
 enum WrapperKindMapped {
     Python = 1,
     Csharp = 2,
     Cpp = 3,
+    Typescript = 4,
 }
 
 fn map_wrapper_kind(language: &str) -> Result<WrapperKindMapped, HackArenaError> {
@@ -309,10 +316,44 @@ fn map_wrapper_kind(language: &str) -> Result<WrapperKindMapped, HackArenaError>
         "python" => Ok(WrapperKindMapped::Python),
         "csharp" => Ok(WrapperKindMapped::Csharp),
         "cpp" => Ok(WrapperKindMapped::Cpp),
+        "typescript" => Ok(WrapperKindMapped::Typescript),
         _ => Err(HackArenaError::msg(format!(
-            "Wrapper language `{language}` is not implemented yet for submit (supported: `python`, `csharp`, `cpp`)."
+            "Wrapper language `{language}` is not implemented yet for submit (supported: `python`, `csharp`, `cpp`, `typescript`)."
         ))),
     }
+}
+
+fn validate_typescript_wrapper_version(
+    wrapper_id: &str,
+    wrapper_version: &str,
+) -> Result<(), HackArenaError> {
+    if wrapper_version.trim() == "0.0.0" {
+        return Err(HackArenaError::msg(format!(
+            "Wrapper `{wrapper_id}` has placeholder `wrapper.template_version = \"0.0.0\"` in `system/manifest.toml`. Update/install wrapper with a real release version before submit."
+        )));
+    }
+    Ok(())
+}
+
+fn validate_typescript_submit_entries(
+    wrapper_id: &str,
+    entries: &[(PathBuf, String)],
+) -> Result<(), HackArenaError> {
+    let has_package_json = entries.iter().any(|(_, rel)| rel == "package.json");
+    if !has_package_json {
+        return Err(HackArenaError::msg(format!(
+            "Wrapper `{wrapper_id}` TypeScript submit is missing `package.json` at archive root. Ensure `[submit].include` contains `user/package.json`."
+        )));
+    }
+
+    let has_src_files = entries.iter().any(|(_, rel)| rel.starts_with("src/"));
+    if !has_src_files {
+        return Err(HackArenaError::msg(format!(
+            "Wrapper `{wrapper_id}` TypeScript submit is missing files under `src/` in archive root. Ensure `[submit].include` contains `user/src` and is not fully excluded."
+        )));
+    }
+
+    Ok(())
 }
 
 #[derive(Debug)]
@@ -436,12 +477,20 @@ fn collect_files_recursive(root: &Path, out: &mut Vec<PathBuf>) -> Result<(), Ha
     Ok(())
 }
 
-fn build_tar_gz(entries: &[(PathBuf, String)]) -> Result<Vec<u8>, HackArenaError> {
+fn build_tar_gz(
+    entries: &[(PathBuf, String)],
+    sanitize_typescript_package_json: bool,
+) -> Result<Vec<u8>, HackArenaError> {
     let encoder = GzEncoder::new(Vec::new(), Compression::default());
     let mut tar = tar::Builder::new(encoder);
     for (abs, rel) in entries {
         if rel == "requirements.txt" {
             let sanitized = sanitize_requirements_for_submit(abs)?;
+            append_bytes_to_tar(&mut tar, rel, &sanitized)?;
+            continue;
+        }
+        if sanitize_typescript_package_json && rel == "package.json" {
+            let sanitized = sanitize_package_json_for_submit(abs)?;
             append_bytes_to_tar(&mut tar, rel, &sanitized)?;
             continue;
         }
@@ -484,6 +533,46 @@ fn sanitize_requirements_for_submit(path: &Path) -> Result<Vec<u8>, HackArenaErr
         out.push('\n');
     }
     Ok(out.into_bytes())
+}
+
+fn sanitize_package_json_for_submit(path: &Path) -> Result<Vec<u8>, HackArenaError> {
+    let content = fs::read_to_string(path).map_err(|e| HackArenaError::io_with_path(path, e))?;
+    let mut parsed: serde_json::Value = serde_json::from_str(&content).map_err(|e| {
+        HackArenaError::msg(format!("Invalid JSON in {}: {}", path.display(), e))
+    })?;
+    let Some(root) = parsed.as_object_mut() else {
+        return Err(HackArenaError::msg(format!(
+            "{} must contain a JSON object at root.",
+            path.display()
+        )));
+    };
+
+    if let Some(dependencies_value) = root.get_mut("dependencies")
+        && let Some(dependencies) = dependencies_value.as_object_mut()
+    {
+        dependencies.retain(|_, value| {
+            let Some(raw) = value.as_str() else {
+                return true;
+            };
+            !is_managed_typescript_vendor_dependency_value(raw)
+        });
+    }
+
+    let mut out = serde_json::to_string_pretty(&parsed)
+        .map_err(|e| HackArenaError::msg(format!("Failed to serialize {}: {}", path.display(), e)))?;
+    out.push('\n');
+    Ok(out.into_bytes())
+}
+
+fn is_managed_typescript_vendor_dependency_value(value: &str) -> bool {
+    let normalized = value.trim().replace('\\', "/").to_ascii_lowercase();
+    let Some(path) = normalized.strip_prefix("file:") else {
+        return false;
+    };
+    let path = path.trim_start_matches("./").trim_start_matches('/');
+    (path.starts_with(".vendor/hackarena3-wrapper-ts-")
+        || path.starts_with("user/.vendor/hackarena3-wrapper-ts-"))
+        && path.ends_with(".tgz")
 }
 
 fn is_hackarena3_requirement_comment(line: &str) -> bool {
@@ -759,11 +848,105 @@ async fn submit_build(
 
 #[cfg(test)]
 mod tests {
-    use super::map_wrapper_kind;
+    use super::{
+        is_managed_typescript_vendor_dependency_value, map_wrapper_kind,
+        sanitize_package_json_for_submit, validate_typescript_submit_entries,
+        validate_typescript_wrapper_version,
+    };
+    use std::fs;
+    use std::path::PathBuf;
 
     #[test]
     fn map_wrapper_kind_supports_cpp() {
         let kind = map_wrapper_kind("cpp").expect("cpp should be supported");
         assert_eq!(kind as i32, 3);
+    }
+
+    #[test]
+    fn map_wrapper_kind_supports_typescript() {
+        let kind = map_wrapper_kind("typescript").expect("typescript should be supported");
+        assert_eq!(kind as i32, 4);
+    }
+
+    #[test]
+    fn validate_typescript_wrapper_version_rejects_placeholder() {
+        let err = validate_typescript_wrapper_version("typescript", "0.0.0")
+            .expect_err("placeholder should fail");
+        assert!(err.to_string().contains("placeholder"));
+    }
+
+    #[test]
+    fn validate_typescript_submit_entries_requires_package_json() {
+        let entries = vec![(PathBuf::from("abs"), "src/main.ts".to_string())];
+        let err =
+            validate_typescript_submit_entries("typescript", &entries).expect_err("should fail");
+        assert!(err.to_string().contains("package.json"));
+    }
+
+    #[test]
+    fn validate_typescript_submit_entries_requires_src() {
+        let entries = vec![(PathBuf::from("abs"), "package.json".to_string())];
+        let err =
+            validate_typescript_submit_entries("typescript", &entries).expect_err("should fail");
+        assert!(err.to_string().contains("files under `src/`"));
+    }
+
+    #[test]
+    fn validate_typescript_submit_entries_accepts_valid_set() {
+        let entries = vec![
+            (PathBuf::from("abs-pkg"), "package.json".to_string()),
+            (PathBuf::from("abs-src"), "src/bot/index.ts".to_string()),
+        ];
+        validate_typescript_submit_entries("typescript", &entries).expect("valid should pass");
+    }
+
+    #[test]
+    fn ts_vendor_dependency_pattern_matches_expected_forms() {
+        assert!(is_managed_typescript_vendor_dependency_value(
+            "file:./.vendor/hackarena3-wrapper-ts-0.2.0-beta.1.tgz"
+        ));
+        assert!(is_managed_typescript_vendor_dependency_value(
+            "file:user/.vendor/hackarena3-wrapper-ts-0.2.0-beta.1.tgz"
+        ));
+        assert!(!is_managed_typescript_vendor_dependency_value(
+            "file:./.vendor/something-else.tgz"
+        ));
+        assert!(!is_managed_typescript_vendor_dependency_value(
+            "^4.2.0"
+        ));
+    }
+
+    #[test]
+    fn sanitize_package_json_for_submit_removes_only_managed_ts_vendor_dependency() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let package_path = dir.path().join("package.json");
+        fs::write(
+            &package_path,
+            r#"{
+  "name": "bot",
+  "dependencies": {
+    "hackarena3-wrapper-ts": "file:./.vendor/hackarena3-wrapper-ts-0.2.0-beta.1.tgz",
+    "axios": "^1.7.0",
+    "left-pad": "file:./.vendor/left-pad-local.tgz"
+  }
+}
+"#,
+        )
+        .expect("write package");
+
+        let sanitized = sanitize_package_json_for_submit(&package_path).expect("sanitize");
+        let parsed: serde_json::Value =
+            serde_json::from_slice(&sanitized).expect("parse sanitized json");
+        assert!(parsed["dependencies"]
+            .get("hackarena3-wrapper-ts")
+            .is_none());
+        assert_eq!(
+            parsed["dependencies"]["axios"],
+            serde_json::Value::String("^1.7.0".to_string())
+        );
+        assert_eq!(
+            parsed["dependencies"]["left-pad"],
+            serde_json::Value::String("file:./.vendor/left-pad-local.tgz".to_string())
+        );
     }
 }
