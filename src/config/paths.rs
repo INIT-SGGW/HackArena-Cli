@@ -75,6 +75,31 @@ impl Paths {
     pub fn logs_dir(&self) -> PathBuf {
         self.data_root().join("logs")
     }
+
+    /// Returns `<data_root>/self-update`.
+    pub fn self_update_root(&self) -> PathBuf {
+        self.data_root().join("self-update")
+    }
+
+    /// Returns `<self_update_root>/bin`.
+    pub fn self_update_bin_dir(&self) -> PathBuf {
+        self.self_update_root().join("bin")
+    }
+
+    /// Returns `<self_update_root>/backups`.
+    pub fn self_update_backups_dir(&self) -> PathBuf {
+        self.self_update_root().join("backups")
+    }
+
+    /// Returns `<self_update_root>/staging`.
+    pub fn self_update_staging_dir(&self) -> PathBuf {
+        self.self_update_root().join("staging")
+    }
+
+    /// Returns `<self_update_root>/session.json`.
+    pub fn self_update_session_path(&self) -> PathBuf {
+        self.self_update_root().join("session.json")
+    }
 }
 
 #[cfg(not(windows))]

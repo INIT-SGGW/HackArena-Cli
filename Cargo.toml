@@ -1,6 +1,6 @@
 [package]
 name = "hackarena-cli"
-version = "0.1.0"
+version = "0.2.0-beta.1"
 edition = "2024"
 
 [dependencies]
@@ -24,6 +24,7 @@ futures-util = "0.3"
 cfg-if = "1"
 owo-colors = "4"
 rpassword = "7.3.1"
+semver = "1"
 
 [build-dependencies]
 tonic-build = "0.13"

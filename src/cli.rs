@@ -108,6 +108,21 @@ pub enum Command {
         description: Option<String>,
     },
 
+    /// Update the `hackarena` CLI binary in place.
+    SelfUpdate {
+        /// Do not use cached release metadata (always fetch from network).
+        #[arg(long)]
+        no_cache: bool,
+
+        /// Allow prerelease versions.
+        #[arg(long)]
+        prerelease: bool,
+
+        /// Update to a specific GitHub release tag (e.g. `v0.2.0-beta.1`).
+        #[arg(long)]
+        tag: Option<String>,
+    },
+
     /// Remove downloaded/installed artifacts (interactive by default).
     Clean {
         /// Remove everything (project + global Paths dirs).

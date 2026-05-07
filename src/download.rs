@@ -15,11 +15,28 @@ pub async fn download_to_cache(
     cache_filename: &str,
     expected_sha256_hex: &str,
 ) -> Result<PathBuf, HackArenaError> {
-    let cache_dir = paths.downloads_cache_dir();
-    ensure_dir(&cache_dir)?;
+    download_to_dir(
+        &paths.downloads_cache_dir(),
+        url,
+        cache_filename,
+        expected_sha256_hex,
+    )
+    .await
+}
 
-    let cache_path = cache_dir.join(cache_filename);
-    let tmp_path = cache_dir.join(format!("{cache_filename}.partial"));
+/// Downloads an artifact into an arbitrary directory and returns the local file path.
+///
+/// Reuses an existing file when its SHA-256 matches `expected_sha256_hex`.
+pub async fn download_to_dir(
+    target_dir: &Path,
+    url: &str,
+    cache_filename: &str,
+    expected_sha256_hex: &str,
+) -> Result<PathBuf, HackArenaError> {
+    ensure_dir(target_dir)?;
+
+    let cache_path = target_dir.join(cache_filename);
+    let tmp_path = target_dir.join(format!("{cache_filename}.partial"));
 
     if cache_path.is_file() {
         let cached_sha = sha256_file_hex(&cache_path)?;

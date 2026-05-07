@@ -10,6 +10,7 @@ mod download;
 mod error;
 mod github_releases;
 mod install;
+mod self_update;
 mod submission_proto;
 mod submit;
 
@@ -28,6 +29,12 @@ async fn main() {
 }
 
 async fn run() -> Result<(), HackArenaError> {
+    let raw_args = std::env::args_os().skip(1).collect::<Vec<_>>();
+    if self_update::is_internal_updater_invocation(&raw_args) {
+        self_update::run_internal_updater_from_args()?;
+        return Ok(());
+    }
+
     let cli = Cli::parse();
     let paths = Paths::discover()?;
 
@@ -160,6 +167,11 @@ impl Command {
             Command::Submit { slot, description } => {
                 submit::submit(paths, *slot, description.as_deref()).await?
             }
+            Command::SelfUpdate {
+                no_cache,
+                prerelease,
+                tag,
+            } => self_update::self_update(paths, *no_cache, *prerelease, tag.as_deref()).await?,
             Command::Clean {
                 all,
                 project,

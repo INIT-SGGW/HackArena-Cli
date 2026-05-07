@@ -536,7 +536,7 @@ dependencies = [
 
 [[package]]
 name = "hackarena-cli"
-version = "0.1.0"
+version = "0.2.0-beta.1"
 dependencies = [
  "cfg-if",
  "clap",
@@ -549,6 +549,7 @@ dependencies = [
  "protoc-bin-vendored",
  "reqwest",
  "rpassword",
+ "semver",
  "serde",
  "serde_json",
  "sha2",

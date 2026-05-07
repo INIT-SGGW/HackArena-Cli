@@ -14,6 +14,7 @@ use std::time::{Duration, SystemTime};
 
 const AUTH_REPO: &str = "INIT-SGGW/HackArena-Auth-Cli";
 const BACKEND_REPO_EDITION_3: &str = "INIT-SGGW/HackArena3.0-Backend";
+const HACKARENA_CLI_REPO: &str = "INIT-SGGW/HackArena-Cli";
 const WRAPPERS_EDITION_3: &[(&str, &str)] = &[
     ("python", "INIT-SGGW/HackArena3.0-ApiWrapper-Python"),
     ("csharp", "INIT-SGGW/HackArena3.0-ApiWrapper-CSharp"),
@@ -83,10 +84,10 @@ struct GithubAsset {
 }
 
 #[derive(Debug, Clone)]
-struct ResolvedReleaseAsset {
-    name: String,
-    url: String,
-    sha256: String,
+pub struct ResolvedReleaseAsset {
+    pub name: String,
+    pub url: String,
+    pub sha256: String,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -101,6 +102,7 @@ enum ComponentSelector<'a> {
     Auth,
     Backend,
     Wrapper(&'a str),
+    HackArenaCli,
 }
 
 pub fn wrapper_base_id(wrapper_id: &str) -> &str {
@@ -248,6 +250,40 @@ pub async fn latest_backend_from_releases(
         installed_at_unix: None,
         files: vec![],
     }))
+}
+
+pub async fn latest_self_update_release_tag(
+    paths: &Paths,
+    no_cache: bool,
+    prerelease: bool,
+) -> Result<Option<String>, HackArenaError> {
+    Ok(
+        latest_self_update_repo_release(paths, !no_cache, prerelease)
+            .await?
+            .map(|release| release.tag_name),
+    )
+}
+
+pub async fn self_update_release_by_tag(
+    paths: &Paths,
+    release_tag: &str,
+    no_cache: bool,
+    linux_libc_override: Option<LinuxLibcMode>,
+) -> Result<Option<ResolvedReleaseAsset>, HackArenaError> {
+    let target = current_target_triples(linux_libc_override)?;
+    let use_cache = !no_cache;
+    let Some(release) = release_by_tag(paths, HACKARENA_CLI_REPO, release_tag, use_cache).await?
+    else {
+        return Ok(None);
+    };
+    resolve_component_from_release(
+        HACKARENA_CLI_REPO,
+        &release,
+        ComponentSelector::HackArenaCli,
+        &target,
+    )
+    .await
+    .map(Some)
 }
 
 pub async fn latest_wrapper_from_releases(
@@ -548,6 +584,16 @@ async fn resolve_component_from_release(
     target: &TargetTripleResolution,
 ) -> Result<ResolvedReleaseAsset, HackArenaError> {
     let checksums = fetch_release_checksums(repo, release).await?;
+    resolve_component_from_release_with_checksums(repo, release, component, target, &checksums)
+}
+
+fn resolve_component_from_release_with_checksums(
+    repo: &str,
+    release: &GithubRelease,
+    component: ComponentSelector<'_>,
+    target: &TargetTripleResolution,
+    checksums: &HashMap<String, String>,
+) -> Result<ResolvedReleaseAsset, HackArenaError> {
     let selected = select_component_asset(&release.assets, component, target)?;
     let expected_sha = find_checksum_for_asset(&checksums, &selected.name).ok_or_else(|| {
         HackArenaError::msg(format!(
@@ -886,6 +932,37 @@ async fn latest_release(
     Ok(selected)
 }
 
+async fn latest_self_update_repo_release(
+    paths: &Paths,
+    use_cache: bool,
+    allow_prerelease: bool,
+) -> Result<Option<GithubRelease>, HackArenaError> {
+    let cache_path = cache_path_for_self_update_repo(paths, allow_prerelease);
+    if use_cache && cache_path.exists() && cache_is_fresh(&cache_path, RELEASE_CACHE_TTL)? {
+        let bytes =
+            std::fs::read(&cache_path).map_err(|e| HackArenaError::io_with_path(&cache_path, e))?;
+        let release = serde_json::from_slice(&bytes)
+            .map_err(|e| HackArenaError::json_with_path(&cache_path, e))?;
+        return Ok(Some(release));
+    }
+
+    let url = format!("https://api.github.com/repos/{HACKARENA_CLI_REPO}/releases?per_page=20");
+    let releases: Vec<GithubRelease> = fetch_json_with_github_auth(&url).await?;
+    let selected = select_latest_self_update_release(&releases, allow_prerelease);
+
+    if let Some(release) = selected.clone() {
+        if let Some(parent) = cache_path.parent() {
+            ensure_dir(parent)?;
+        }
+        let data = serde_json::to_vec_pretty(&release)
+            .map_err(|e| HackArenaError::json_with_path(&cache_path, e))?;
+        std::fs::write(&cache_path, data)
+            .map_err(|e| HackArenaError::io_with_path(&cache_path, e))?;
+    }
+
+    Ok(selected)
+}
+
 async fn release_by_tag(
     paths: &Paths,
     repo: &str,
@@ -942,6 +1019,16 @@ fn select_latest_release(
     None
 }
 
+fn select_latest_self_update_release(
+    releases: &[GithubRelease],
+    allow_prerelease: bool,
+) -> Option<GithubRelease> {
+    if allow_prerelease {
+        return releases.iter().find(|r| !r.draft).cloned();
+    }
+    select_latest_release(releases, false)
+}
+
 fn cache_path_for_repo(paths: &Paths, repo: &str, allow_prerelease: bool) -> PathBuf {
     let mut hasher = Sha256::new();
     hasher.update(repo.as_bytes());
@@ -956,6 +1043,22 @@ fn cache_path_for_repo(paths: &Paths, repo: &str, allow_prerelease: bool) -> Pat
         .releases_cache_dir()
         .join(key)
         .join("latest_release.json")
+}
+
+fn cache_path_for_self_update_repo(paths: &Paths, allow_prerelease: bool) -> PathBuf {
+    let mut hasher = Sha256::new();
+    hasher.update(HACKARENA_CLI_REPO.as_bytes());
+    let mode_marker: &[u8] = if allow_prerelease {
+        b":self_update_allow_prerelease"
+    } else {
+        b":self_update_stable_only"
+    };
+    hasher.update(mode_marker);
+    let key = hex::encode(hasher.finalize());
+    paths
+        .releases_cache_dir()
+        .join(key)
+        .join("latest_self_update_release.json")
 }
 
 fn cache_path_for_repo_tag(paths: &Paths, repo: &str, release_tag: &str) -> PathBuf {
@@ -1174,6 +1277,9 @@ fn is_component_asset(name: &str, component: ComponentSelector<'_>, triple: &str
             is_wrapper_platform_asset(&lower, wrapper_id, triple)
                 || is_wrapper_universal_asset(&lower, wrapper_id)
         }
+        ComponentSelector::HackArenaCli => {
+            is_self_update_binary_asset(&lower, "hackarena-cli", triple)
+        }
     }
 }
 
@@ -1193,6 +1299,9 @@ fn expected_pattern(component: ComponentSelector<'_>, triple: &str) -> String {
                 "wrapper-{wrapper_id}-v<version>-{triple}.<zip|tar.gz> OR wrapper-{wrapper_id}-v<version>.<zip|tar.gz>"
             )
         }
+        ComponentSelector::HackArenaCli => {
+            format!("hackarena-cli-v<version>-{triple}.<exe|tar.gz>")
+        }
     }
 }
 
@@ -1201,6 +1310,7 @@ fn component_name(component: ComponentSelector<'_>) -> String {
         ComponentSelector::Auth => "auth".to_string(),
         ComponentSelector::Backend => "backend".to_string(),
         ComponentSelector::Wrapper(wrapper_id) => format!("wrapper `{wrapper_id}`"),
+        ComponentSelector::HackArenaCli => "hackarena CLI".to_string(),
     }
 }
 
@@ -1218,6 +1328,14 @@ fn is_backend_local_asset(name_lower: &str, triple: &str) -> bool {
         && name_lower.contains(&triple_part)
         && name_lower.contains("-v")
         && is_archive_extension(name_lower)
+}
+
+fn is_self_update_binary_asset(name_lower: &str, prefix: &str, triple: &str) -> bool {
+    let triple_part = format!("-{}", triple.to_ascii_lowercase());
+    let expected_prefix = format!("{prefix}-v");
+    name_lower.starts_with(&expected_prefix)
+        && name_lower.contains(&triple_part)
+        && is_auth_extension(name_lower)
 }
 
 fn is_wrapper_platform_asset(name: &str, wrapper_id: &str, triple: &str) -> bool {
@@ -1781,7 +1899,8 @@ mod tests {
         cpp_sdk_asset_candidates, extract_wrapper_version_from_asset_name, is_component_asset,
         linux_target_triples_for_arch, parse_sha256_sums, resolve_cpp_sdk_asset,
         resolve_linux_mode_from_inputs, resolve_typescript_runtime_tgz_asset,
-        select_component_asset, select_latest_release, wrapper_base_id,
+        select_component_asset, select_latest_release, select_latest_self_update_release,
+        wrapper_base_id,
     };
     use std::collections::HashMap;
 
@@ -2304,6 +2423,28 @@ bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb *ha3-backend-lo
         let selected =
             select_latest_release(&[prerelease], true).expect("fallback should select beta");
         assert_eq!(selected.tag_name, "v0.1.0-beta.1");
+    }
+
+    #[test]
+    fn self_update_release_selection_prefers_prerelease_when_requested() {
+        let prerelease = GithubRelease {
+            tag_name: "v0.2.0-beta.1".to_string(),
+            name: "beta".to_string(),
+            draft: false,
+            prerelease: true,
+            assets: vec![],
+        };
+        let stable = GithubRelease {
+            tag_name: "v0.1.0".to_string(),
+            name: "stable".to_string(),
+            draft: false,
+            prerelease: false,
+            assets: vec![],
+        };
+
+        let selected = select_latest_self_update_release(&[prerelease, stable], true)
+            .expect("self-update should select beta");
+        assert_eq!(selected.tag_name, "v0.2.0-beta.1");
     }
 
     #[test]
