@@ -51,6 +51,10 @@ pub enum Command {
         #[command(subcommand)]
         component: Option<InstallSubcommand>,
 
+        /// Enable experimental wrapper installs.
+        #[arg(long)]
+        experimental: bool,
+
         /// Linux libc mode for release asset selection (`auto`, `gnu`, `musl`).
         #[arg(long, value_enum, hide = !cfg!(target_os = "linux"))]
         linux_libc: Option<LinuxLibcArg>,
@@ -173,8 +177,12 @@ pub enum InstallSubcommand {
 
     /// Install a wrapper bundle by id.
     Wrapper {
-        /// Wrapper id (e.g. `python`, `csharp`, `python_1`). If omitted, CLI will show available wrappers.
+        /// Wrapper id (e.g. `python`, `python_1`; legacy ids require `--experimental`). If omitted, CLI will show available wrappers.
         wrapper_id: Option<String>,
+
+        /// Enable experimental wrapper installs.
+        #[arg(long)]
+        experimental: bool,
 
         /// Do not use cached release metadata (always fetch from network).
         #[arg(long)]

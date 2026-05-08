@@ -99,6 +99,7 @@ impl Command {
             Command::Use { edition } => install::use_edition(paths, edition).await?,
             Command::Install {
                 component,
+                experimental,
                 skip_wrapper,
                 no_cache,
                 prerelease,
@@ -107,6 +108,7 @@ impl Command {
                 None => {
                     install::install(
                         paths,
+                        *experimental,
                         *skip_wrapper,
                         *no_cache,
                         *prerelease,
@@ -140,6 +142,7 @@ impl Command {
                 }
                 Some(InstallSubcommand::Wrapper {
                     wrapper_id,
+                    experimental: sub_experimental,
                     no_cache: sub_no_cache,
                     prerelease: sub_prerelease,
                     tag,
@@ -147,6 +150,7 @@ impl Command {
                     install::install_wrapper(
                         paths,
                         wrapper_id.as_deref(),
+                        *experimental || *sub_experimental,
                         *no_cache || *sub_no_cache,
                         *prerelease || *sub_prerelease,
                         tag.as_deref(),

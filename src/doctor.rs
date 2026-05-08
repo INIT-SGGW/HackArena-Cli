@@ -55,6 +55,13 @@ pub async fn doctor(
         cwd.join("wrappers").exists(),
         &cwd.join("wrappers"),
     );
+    if let Ok(manifest) = load_project_manifest(&cwd) {
+        for wrapper_id in manifest.wrappers.keys() {
+            if github_releases::is_experimental_wrapper(&project.edition, wrapper_id) {
+                print_experimental_wrapper_note(wrapper_id, &project.edition);
+            }
+        }
+    }
 
     Ok(())
 }
@@ -143,6 +150,20 @@ fn print_warn(label: &str, status: &str, path: &Path) {
         println!("{label}: {} ({})", status.yellow(), path.display());
     } else {
         println!("{label}: {status} ({})", path.display());
+    }
+}
+
+fn print_experimental_wrapper_note(wrapper_id: &str, edition: &str) {
+    let status = "experimental";
+    if std::io::stdout().is_terminal() {
+        println!(
+            "wrapper/{wrapper_id}: {} (installed; not supported for official submission in edition {edition})",
+            status.yellow(),
+        );
+    } else {
+        println!(
+            "wrapper/{wrapper_id}: {status} (installed; not supported for official submission in edition {edition})"
+        );
     }
 }
 
@@ -396,6 +417,67 @@ pub async fn status(
         }
     }
 
+    for (wrapper_id, current) in installed_wrappers.iter().filter(|(wrapper_id, _)| {
+        github_releases::is_experimental_wrapper(&project.edition, wrapper_id)
+    }) {
+        let latest = github_releases::latest_wrapper_from_releases(
+            paths,
+            &project.edition,
+            wrapper_id,
+            no_cache,
+            prerelease,
+            None,
+        )
+        .await;
+        let current_wrapper_version = wrapper_version_from_asset_url(
+            github_releases::wrapper_base_id(wrapper_id),
+            &current.url,
+        );
+        let latest_wrapper_version = latest
+            .as_ref()
+            .ok()
+            .and_then(|bundle| bundle.as_ref())
+            .and_then(|bundle| {
+                wrapper_version_from_asset_url(
+                    github_releases::wrapper_base_id(wrapper_id),
+                    &bundle.url,
+                )
+            });
+        match latest {
+            Err(_) => println!(
+                "wrapper/{wrapper_id}: experimental, installed (cannot check latest; not supported for official submission in edition {})",
+                project.edition
+            ),
+            Ok(None) => println!(
+                "wrapper/{wrapper_id}: experimental, installed but no release available now"
+            ),
+            Ok(Some(latest_bundle)) => {
+                let current_sha = current.sha256.as_deref();
+                let latest_sha = latest_bundle.sha256.as_deref();
+                if current_sha == latest_sha && current.url == latest_bundle.url {
+                    if let Some(version) = current_wrapper_version
+                        .as_deref()
+                        .or(latest_wrapper_version.as_deref())
+                    {
+                        println!(
+                            "wrapper/{wrapper_id}: experimental, up to date ({})",
+                            format_version(version)
+                        );
+                    } else {
+                        println!("wrapper/{wrapper_id}: experimental, up to date");
+                    }
+                } else {
+                    println!(
+                        "wrapper/{wrapper_id}: experimental, update available ({} -> {}; run `{}`)",
+                        format_version_opt(current_wrapper_version.as_deref()),
+                        format_version_opt(latest_wrapper_version.as_deref()),
+                        cmd_hint::run_cli(&format!("update wrapper {wrapper_id}"))
+                    );
+                }
+            }
+        }
+    }
+
     for (wrapper_id, _current) in installed_wrappers {
         if !github_releases::has_wrapper_repo(&project.edition, &wrapper_id) {
             println!("wrapper/{wrapper_id}: installed (not configured for this edition)");
@@ -548,6 +630,14 @@ fn backend_version_from_asset_url(url: &str) -> Option<String> {
 fn wrapper_version_from_asset_url(wrapper_id: &str, url: &str) -> Option<String> {
     let asset = asset_name_from_url(url)?;
     let stem = strip_asset_extension(&asset);
+    if wrapper_id.eq_ignore_ascii_case("typescript") {
+        let custom_prefix = "hackarena3-template-ts-v";
+        if stem.to_ascii_lowercase().starts_with(custom_prefix) {
+            let version = &stem[custom_prefix.len()..];
+            let normalized = normalize_version(version);
+            return (!normalized.is_empty()).then_some(normalized);
+        }
+    }
     let prefix = format!("wrapper-{}-v", wrapper_id.to_ascii_lowercase());
     if !stem.to_ascii_lowercase().starts_with(&prefix) {
         return None;

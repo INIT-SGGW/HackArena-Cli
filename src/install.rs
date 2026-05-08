@@ -40,6 +40,7 @@ pub async fn use_edition(_paths: &Paths, edition: &str) -> Result<(), HackArenaE
 /// Installs missing components using the current directory as a project.
 pub async fn install(
     paths: &Paths,
+    experimental: bool,
     skip_wrapper: bool,
     no_cache: bool,
     prerelease: bool,
@@ -59,9 +60,31 @@ pub async fn install(
 
     let config = load_effective_config(paths, &project, no_cache, prerelease, linux_libc).await?;
     let installed_wrappers = discover_installed_wrappers(&cwd);
-    let mut chosen_wrapper = choose_wrapper_id(&project, &config, &installed_wrappers)?;
-    if !skip_wrapper && installed_wrappers.is_empty() && chosen_wrapper.is_none() {
-        chosen_wrapper = choose_wrapper_for_fresh_install(&project.edition, &config)?;
+    let wrappers_root = cwd.join(PROJECT_WRAPPERS_DIR);
+    let project_wrapper_requires_experimental =
+        project.wrapper_id.as_deref().is_some_and(|wrapper_id| {
+            github_releases::is_experimental_wrapper(&project.edition, wrapper_id)
+        }) && !experimental;
+    let mut chosen_wrapper =
+        choose_wrapper_id(&project, &config, &installed_wrappers, experimental)?;
+    if !skip_wrapper && project_wrapper_requires_experimental {
+        if let Some(wrapper_id) = project.wrapper_id.as_deref() {
+            let wrapper_dir = wrappers_root.join(wrapper_id);
+            if !wrapper_dir.exists() {
+                println!(
+                    "Warning: project wrapper `{wrapper_id}` is experimental. Run `{}` to install it. It is not supported for official submission in edition {}.",
+                    cmd_hint::run_cli(&format!("install wrapper {wrapper_id} --experimental")),
+                    project.edition
+                );
+            }
+        }
+    }
+    if !skip_wrapper
+        && installed_wrappers.is_empty()
+        && chosen_wrapper.is_none()
+        && !project_wrapper_requires_experimental
+    {
+        chosen_wrapper = choose_wrapper_for_fresh_install(&project.edition, &config, experimental)?;
     }
     if !skip_wrapper && !installed_wrappers.is_empty() {
         println!("Installed wrappers: {}", installed_wrappers.join(", "));
@@ -94,14 +117,20 @@ pub async fn install(
         println!("Warning: backend release is not available yet on GitHub for this edition.");
     }
     if !skip_wrapper {
-        for wrapper_id in github_releases::wrapper_ids_for_edition(&project.edition) {
+        for wrapper_id in visible_wrapper_ids_for_install(&project.edition, experimental) {
             if config.wrapper(wrapper_id).is_none() {
-                println!("Warning: wrapper `{wrapper_id}` release is not available yet on GitHub.");
+                let label =
+                    if github_releases::is_experimental_wrapper(&project.edition, wrapper_id) {
+                        "experimental wrapper"
+                    } else {
+                        "wrapper"
+                    };
+                println!("Warning: {label} `{wrapper_id}` release is not available yet on GitHub.");
             }
         }
         if let Some(wrapper_id) = chosen_wrapper.as_deref() {
             let managed_wrapper_id = github_releases::wrapper_base_id(wrapper_id);
-            let wrapper_dir = cwd.join(PROJECT_WRAPPERS_DIR).join(wrapper_id);
+            let wrapper_dir = wrappers_root.join(wrapper_id);
             if wrapper_dir.exists() {
                 if validate_wrapper_install_layout(wrapper_id, &wrapper_dir).is_ok() {
                     println!(
@@ -380,6 +409,7 @@ pub async fn install_backend(
 pub async fn install_wrapper(
     paths: &Paths,
     wrapper_id: Option<&str>,
+    experimental: bool,
     no_cache: bool,
     prerelease: bool,
     release_tag: Option<&str>,
@@ -398,12 +428,18 @@ pub async fn install_wrapper(
     let config = load_effective_config(paths, &project, no_cache, prerelease, linux_libc).await?;
     let requested_wrapper_id = match wrapper_id {
         Some(id) => id.to_string(),
-        None => choose_wrapper_for_install_command(&project.edition, &config)?,
+        None => choose_wrapper_for_install_command(&project.edition, &config, experimental)?,
     };
 
     let wrappers_root = cwd.join(PROJECT_WRAPPERS_DIR);
     ensure_dir(&wrappers_root)?;
     let managed_wrapper_id = github_releases::wrapper_base_id(&requested_wrapper_id).to_string();
+    ensure_wrapper_install_allowed(
+        &project.edition,
+        &requested_wrapper_id,
+        &managed_wrapper_id,
+        experimental,
+    )?;
     let requested_is_base = requested_wrapper_id == managed_wrapper_id;
     let mut target_wrapper_id = requested_wrapper_id;
     if requested_is_base {
@@ -1896,29 +1932,67 @@ fn choose_wrapper_id(
     project: &ProjectConfig,
     config: &EditionConfig,
     installed: &[String],
+    include_experimental: bool,
 ) -> Result<Option<String>, HackArenaError> {
     if let Some(wrapper_id) = project.wrapper_id.as_ref() {
-        if config
-            .wrapper(github_releases::wrapper_base_id(wrapper_id))
-            .is_some()
-        {
+        let managed_wrapper_id = github_releases::wrapper_base_id(wrapper_id);
+        if config.wrapper(managed_wrapper_id).is_some() {
+            if github_releases::is_experimental_wrapper(&project.edition, wrapper_id)
+                && !include_experimental
+            {
+                return Ok(None);
+            }
             return Ok(Some(wrapper_id.clone()));
         }
     }
     if installed.len() == 1 {
+        if github_releases::is_experimental_wrapper(&project.edition, &installed[0])
+            && !include_experimental
+        {
+            return Ok(None);
+        }
         return Ok(Some(installed[0].clone()));
     }
     if installed.is_empty() {
-        if config.wrappers.len() == 1 {
-            return Ok(Some(config.wrappers[0].id.clone()));
+        let installable =
+            wrapper_choices_for_edition(&project.edition, config, include_experimental)
+                .into_iter()
+                .filter(|choice| choice.available)
+                .map(|choice| choice.id)
+                .collect::<Vec<_>>();
+        if installable.len() == 1 {
+            return Ok(Some(installable[0].clone()));
         }
         return Ok(None);
     }
     Ok(None)
 }
 
-fn wrapper_choices_for_edition(edition: &str, config: &EditionConfig) -> Vec<(String, bool)> {
-    let mut ids = github_releases::wrapper_ids_for_edition(edition)
+#[derive(Debug, Clone)]
+struct WrapperChoice {
+    id: String,
+    available: bool,
+    experimental: bool,
+}
+
+fn visible_wrapper_ids_for_install(edition: &str, include_experimental: bool) -> Vec<&'static str> {
+    let mut ids = github_releases::wrapper_ids_for_edition(edition);
+    if include_experimental {
+        ids.extend(github_releases::experimental_wrapper_ids_for_edition(
+            edition,
+        ));
+    }
+    ids.sort();
+    ids.dedup();
+    ids
+}
+
+fn wrapper_choices_for_edition(
+    edition: &str,
+    config: &EditionConfig,
+    include_experimental: bool,
+) -> Vec<WrapperChoice> {
+    let mut ids = visible_wrapper_ids_for_install(edition, include_experimental)
         .into_iter()
         .map(|id| id.to_string())
         .collect::<Vec<_>>();
@@ -1932,31 +2006,56 @@ fn wrapper_choices_for_edition(edition: &str, config: &EditionConfig) -> Vec<(St
             let available = config
                 .wrapper(github_releases::wrapper_base_id(&id))
                 .is_some();
-            (id, available)
+            let experimental = github_releases::is_experimental_wrapper(edition, &id);
+            WrapperChoice {
+                id,
+                available,
+                experimental,
+            }
         })
         .collect()
 }
 
-fn print_available_wrappers(choices: &[(String, bool)]) {
+fn print_available_wrappers(choices: &[WrapperChoice]) {
     println!("Available wrappers:");
-    for (id, available) in choices {
-        if *available {
-            println!("  - {id}");
-        } else {
-            println!("  - {id} (no release yet)");
-        }
+    for choice in choices {
+        let suffix = match (choice.experimental, choice.available) {
+            (true, true) => " (experimental)",
+            (true, false) => " (experimental, no release yet)",
+            (false, true) => "",
+            (false, false) => " (no release yet)",
+        };
+        println!("  - {}{}", choice.id, suffix);
     }
+}
+
+fn ensure_wrapper_install_allowed(
+    edition: &str,
+    requested_wrapper_id: &str,
+    managed_wrapper_id: &str,
+    experimental: bool,
+) -> Result<(), HackArenaError> {
+    if github_releases::is_experimental_wrapper(edition, managed_wrapper_id) && !experimental {
+        return Err(HackArenaError::msg(format!(
+            "Wrapper `{requested_wrapper_id}` is experimental for edition `{edition}`. Re-run with `{}`. It is not supported for official submission in edition `{edition}`.",
+            cmd_hint::run_cli(&format!(
+                "install wrapper {requested_wrapper_id} --experimental"
+            ))
+        )));
+    }
+    Ok(())
 }
 
 fn choose_wrapper_for_fresh_install(
     edition: &str,
     config: &EditionConfig,
+    include_experimental: bool,
 ) -> Result<Option<String>, HackArenaError> {
-    let choices = wrapper_choices_for_edition(edition, config);
+    let choices = wrapper_choices_for_edition(edition, config, include_experimental);
     let installable = choices
         .iter()
-        .filter(|(_, available)| *available)
-        .map(|(id, _)| id.clone())
+        .filter(|choice| choice.available)
+        .map(|choice| choice.id.clone())
         .collect::<Vec<_>>();
     if installable.is_empty() {
         return Ok(None);
@@ -1969,22 +2068,26 @@ fn choose_wrapper_for_fresh_install(
             "Multiple wrappers are available ({}) but interactive selection is unavailable.",
             installable.join(", ")
         );
-        println!(
-            "Use `{}` to pick one explicitly.",
-            cmd_hint::run_cli("install wrapper <id>")
-        );
+        let hint = if include_experimental {
+            "install wrapper <id> --experimental"
+        } else {
+            "install wrapper <id>"
+        };
+        println!("Use `{}` to pick one explicitly.", cmd_hint::run_cli(hint));
         return Ok(None);
     }
 
     println!("No wrappers installed yet. Choose wrapper to install:");
+    print_available_wrappers(&choices);
     choose_wrapper_from_list(&installable, "Choose wrapper number: ").map(Some)
 }
 
 fn choose_wrapper_for_install_command(
     edition: &str,
     config: &EditionConfig,
+    include_experimental: bool,
 ) -> Result<String, HackArenaError> {
-    let choices = wrapper_choices_for_edition(edition, config);
+    let choices = wrapper_choices_for_edition(edition, config, include_experimental);
     if choices.is_empty() {
         return Err(HackArenaError::msg(format!(
             "No wrappers are configured for edition `{edition}`."
@@ -1994,8 +2097,8 @@ fn choose_wrapper_for_install_command(
 
     let installable = choices
         .iter()
-        .filter(|(_, available)| *available)
-        .map(|(id, _)| id.clone())
+        .filter(|choice| choice.available)
+        .map(|choice| choice.id.clone())
         .collect::<Vec<_>>();
     if installable.is_empty() {
         return Err(HackArenaError::msg(
@@ -2007,9 +2110,15 @@ fn choose_wrapper_for_install_command(
         return Ok(installable[0].clone());
     }
     if !(io::stdin().is_terminal() && io::stdout().is_terminal()) {
+        let command = if include_experimental {
+            "install wrapper <id> --experimental"
+        } else {
+            "install wrapper <id>"
+        };
         return Err(HackArenaError::msg(format!(
-            "Wrapper id is required in non-interactive mode. Installable wrappers: {}.",
-            installable.join(", ")
+            "Wrapper id is required in non-interactive mode. Installable wrappers: {}. Use `{}`.",
+            installable.join(", "),
+            cmd_hint::run_cli(command)
         )));
     }
 
@@ -2051,13 +2160,16 @@ fn unix_time_seconds() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::{
-        csharp_runtime_version_from_nupkg_url, deploy_wrapper_archive,
+        choose_wrapper_id, csharp_runtime_version_from_nupkg_url, deploy_wrapper_archive,
         ensure_cpp_cmakelists_runtime_include, ensure_csharp_bot_csproj_package_reference,
         ensure_csharp_nuget_config, ensure_python_requirements_has_wheel,
         ensure_python_wrapper_env_api_url, ensure_typescript_package_json_dependency,
-        typescript_runtime_package_name_from_tgz, validate_wrapper_install_layout,
-        vendor_cpp_sdk_archive, vendor_csharp_nupkg, vendor_python_wheel, vendor_typescript_tgz,
+        ensure_wrapper_install_allowed, typescript_runtime_package_name_from_tgz,
+        validate_wrapper_install_layout, vendor_cpp_sdk_archive, vendor_csharp_nupkg,
+        vendor_python_wheel, vendor_typescript_tgz, visible_wrapper_ids_for_install,
+        wrapper_choices_for_edition,
     };
+    use crate::config::{ArtifactSpec, EditionConfig, ProjectConfig, WrapperSpec};
     use flate2::Compression;
     use flate2::write::GzEncoder;
     use std::fs;
@@ -2065,6 +2177,79 @@ mod tests {
     use std::path::Path;
     use tar::Builder;
     use zip::write::SimpleFileOptions;
+
+    fn test_config(wrapper_ids: &[&str]) -> EditionConfig {
+        EditionConfig {
+            edition: "3".to_string(),
+            backend: None,
+            auth_artifact: ArtifactSpec {
+                filename: "https://example.test/auth".to_string(),
+                sha256: "auth".to_string(),
+            },
+            wrappers: wrapper_ids
+                .iter()
+                .map(|id| WrapperSpec {
+                    id: (*id).to_string(),
+                    filename: format!("https://example.test/{id}.zip"),
+                    sha256: format!("sha-{id}"),
+                })
+                .collect(),
+            default_wrapper_id: "python".to_string(),
+            bin_name_auth: "ha-auth.exe".to_string(),
+        }
+    }
+
+    #[test]
+    fn experimental_wrapper_install_requires_flag() {
+        let err = ensure_wrapper_install_allowed("3", "csharp", "csharp", false)
+            .expect_err("experimental wrapper should require flag");
+        assert!(err.to_string().contains("--experimental"));
+
+        ensure_wrapper_install_allowed("3", "csharp", "csharp", true)
+            .expect("experimental wrapper should pass with flag");
+        ensure_wrapper_install_allowed("3", "python", "python", false)
+            .expect("public wrapper should not require flag");
+    }
+
+    #[test]
+    fn install_visibility_hides_experimental_wrappers_without_flag() {
+        assert_eq!(visible_wrapper_ids_for_install("3", false), vec!["python"]);
+        assert_eq!(
+            visible_wrapper_ids_for_install("3", true),
+            vec!["cpp", "csharp", "python", "typescript"]
+        );
+
+        let public_choices =
+            wrapper_choices_for_edition("3", &test_config(&["python", "csharp"]), false);
+        assert_eq!(public_choices.len(), 1);
+        assert_eq!(public_choices[0].id, "python");
+        assert!(!public_choices[0].experimental);
+
+        let all_choices =
+            wrapper_choices_for_edition("3", &test_config(&["python", "csharp"]), true);
+        assert_eq!(all_choices.len(), 4);
+        assert!(
+            all_choices
+                .iter()
+                .any(|choice| choice.id == "csharp" && choice.experimental)
+        );
+    }
+
+    #[test]
+    fn choose_wrapper_id_does_not_auto_select_experimental_without_flag() {
+        let project = ProjectConfig {
+            edition: "3".to_string(),
+            wrapper_id: Some("csharp".to_string()),
+            backend_dir: "backend".into(),
+        };
+        let config = test_config(&["python", "csharp"]);
+
+        let selected = choose_wrapper_id(&project, &config, &[], false).expect("selection");
+        assert!(selected.is_none());
+
+        let selected = choose_wrapper_id(&project, &config, &[], true).expect("selection");
+        assert_eq!(selected.as_deref(), Some("csharp"));
+    }
 
     fn create_wrapper_zip(path: &Path, entries: &[(&str, &str)]) {
         let file = fs::File::create(path).expect("create zip");

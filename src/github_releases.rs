@@ -15,6 +15,13 @@ use std::time::{Duration, SystemTime};
 const AUTH_REPO: &str = "INIT-SGGW/HackArena-Auth-Cli";
 const BACKEND_REPO_EDITION_3: &str = "INIT-SGGW/HackArena3.0-Backend";
 const HACKARENA_CLI_REPO: &str = "INIT-SGGW/HackArena-Cli";
+const PUBLIC_WRAPPERS_EDITION_3: &[(&str, &str)] =
+    &[("python", "INIT-SGGW/HackArena3.0-ApiWrapper-Python")];
+const EXPERIMENTAL_WRAPPERS_EDITION_3: &[(&str, &str)] = &[
+    ("csharp", "INIT-SGGW/HackArena3.0-ApiWrapper-CSharp"),
+    ("cpp", "INIT-SGGW/HackArena3.0-ApiWrapper-Cpp"),
+    ("typescript", "INIT-SGGW/HackArena3.0-ApiWrapper-TypeScript"),
+];
 const WRAPPERS_EDITION_3: &[(&str, &str)] = &[
     ("python", "INIT-SGGW/HackArena3.0-ApiWrapper-Python"),
     ("csharp", "INIT-SGGW/HackArena3.0-ApiWrapper-CSharp"),
@@ -95,6 +102,8 @@ struct EditionRepos {
     auth_repo: &'static str,
     backend_repo: Option<&'static str>,
     wrappers: &'static [(&'static str, &'static str)],
+    public_wrappers: &'static [(&'static str, &'static str)],
+    experimental_wrappers: &'static [(&'static str, &'static str)],
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -123,7 +132,13 @@ pub fn has_backend_repo(edition: &str) -> bool {
 
 pub fn wrapper_ids_for_edition(edition: &str) -> Vec<&'static str> {
     repos_for_edition(edition)
-        .map(|r| r.wrappers.iter().map(|(id, _)| *id).collect())
+        .map(|r| r.public_wrappers.iter().map(|(id, _)| *id).collect())
+        .unwrap_or_default()
+}
+
+pub fn experimental_wrapper_ids_for_edition(edition: &str) -> Vec<&'static str> {
+    repos_for_edition(edition)
+        .map(|r| r.experimental_wrappers.iter().map(|(id, _)| *id).collect())
         .unwrap_or_default()
 }
 
@@ -131,6 +146,13 @@ pub fn has_wrapper_repo(edition: &str, wrapper_id: &str) -> bool {
     let base = wrapper_base_id(wrapper_id);
     repos_for_edition(edition)
         .map(|r| r.wrappers.iter().any(|(id, _)| *id == base))
+        .unwrap_or(false)
+}
+
+pub fn is_experimental_wrapper(edition: &str, wrapper_id: &str) -> bool {
+    let base = wrapper_base_id(wrapper_id);
+    repos_for_edition(edition)
+        .map(|r| r.experimental_wrappers.iter().any(|(id, _)| *id == base))
         .unwrap_or(false)
 }
 
@@ -536,6 +558,8 @@ fn repos_for_edition(edition: &str) -> Option<EditionRepos> {
             auth_repo: AUTH_REPO,
             backend_repo: Some(BACKEND_REPO_EDITION_3),
             wrappers: WRAPPERS_EDITION_3,
+            public_wrappers: PUBLIC_WRAPPERS_EDITION_3,
+            experimental_wrappers: EXPERIMENTAL_WRAPPERS_EDITION_3,
         }),
         _ => None,
     }
@@ -1896,11 +1920,12 @@ fn github_http_status_error(
 mod tests {
     use super::{
         ComponentSelector, GithubAsset, GithubRelease, LinuxLibcMode, TargetTripleResolution,
-        cpp_sdk_asset_candidates, extract_wrapper_version_from_asset_name, is_component_asset,
-        linux_target_triples_for_arch, parse_sha256_sums, resolve_cpp_sdk_asset,
-        resolve_linux_mode_from_inputs, resolve_typescript_runtime_tgz_asset,
-        select_component_asset, select_latest_release, select_latest_self_update_release,
-        wrapper_base_id,
+        cpp_sdk_asset_candidates, experimental_wrapper_ids_for_edition,
+        extract_wrapper_version_from_asset_name, has_wrapper_repo, is_component_asset,
+        is_experimental_wrapper, linux_target_triples_for_arch, parse_sha256_sums,
+        resolve_cpp_sdk_asset, resolve_linux_mode_from_inputs,
+        resolve_typescript_runtime_tgz_asset, select_component_asset, select_latest_release,
+        select_latest_self_update_release, wrapper_base_id, wrapper_ids_for_edition,
     };
     use std::collections::HashMap;
 
@@ -2454,5 +2479,19 @@ bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb *ha3-backend-lo
         assert_eq!(wrapper_base_id("python_123"), "python");
         assert_eq!(wrapper_base_id("python_beta"), "python_beta");
         assert_eq!(wrapper_base_id("python_"), "python_");
+    }
+
+    #[test]
+    fn edition_three_public_and_experimental_wrappers_are_split() {
+        assert_eq!(wrapper_ids_for_edition("3"), vec!["python"]);
+        assert_eq!(
+            experimental_wrapper_ids_for_edition("3"),
+            vec!["csharp", "cpp", "typescript"]
+        );
+        assert!(has_wrapper_repo("3", "python"));
+        assert!(has_wrapper_repo("3", "csharp"));
+        assert!(is_experimental_wrapper("3", "csharp"));
+        assert!(is_experimental_wrapper("3", "cpp_1"));
+        assert!(!is_experimental_wrapper("3", "python"));
     }
 }
