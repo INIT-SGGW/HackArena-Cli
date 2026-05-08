@@ -3,12 +3,31 @@ use crate::config::{
     Paths, is_project_dir, load_project_config, load_project_manifest, project_config_path,
     project_manifest_path, validate_edition,
 };
+use crate::constants::PROJECT_WRAPPERS_DIR;
 use crate::download::sha256_file_hex;
 use crate::error::HackArenaError;
 use crate::github_releases;
+use crate::install::{discover_installed_wrappers, wrapper_install_layout_issue};
 use owo_colors::OwoColorize;
+use std::collections::BTreeSet;
 use std::io::IsTerminal;
-use std::path::Path;
+use std::path::{Path, PathBuf};
+
+#[derive(Debug, Clone)]
+struct WrapperDiskEntry {
+    id: String,
+    path: PathBuf,
+    tracked: bool,
+    experimental: bool,
+    known_for_edition: bool,
+    layout_issue: Option<String>,
+}
+
+impl WrapperDiskEntry {
+    fn is_untracked(&self) -> bool {
+        !self.tracked
+    }
+}
 
 /// Prints diagnostics for the current installation.
 pub async fn doctor(
@@ -55,12 +74,18 @@ pub async fn doctor(
         cwd.join("wrappers").exists(),
         &cwd.join("wrappers"),
     );
-    if let Ok(manifest) = load_project_manifest(&cwd) {
-        for wrapper_id in manifest.wrappers.keys() {
-            if github_releases::is_experimental_wrapper(&project.edition, wrapper_id) {
-                print_experimental_wrapper_note(wrapper_id, &project.edition);
-            }
+    let manifest = load_project_manifest(&cwd).unwrap_or_default();
+    let wrapper_disk_entries = discover_wrapper_disk_entries(&cwd, &project.edition, &manifest);
+    for wrapper_id in manifest.wrappers.keys() {
+        if github_releases::is_experimental_wrapper(&project.edition, wrapper_id) {
+            print_experimental_wrapper_note(wrapper_id, &project.edition);
         }
+    }
+    for entry in wrapper_disk_entries
+        .iter()
+        .filter(|entry| entry.is_untracked())
+    {
+        print_untracked_wrapper_warning(entry);
     }
 
     Ok(())
@@ -167,6 +192,56 @@ fn print_experimental_wrapper_note(wrapper_id: &str, edition: &str) {
     }
 }
 
+fn discover_wrapper_disk_entries(
+    cwd: &Path,
+    edition: &str,
+    manifest: &crate::config::ProjectManifest,
+) -> Vec<WrapperDiskEntry> {
+    let tracked_ids = manifest.wrappers.keys().cloned().collect::<BTreeSet<_>>();
+    discover_installed_wrappers(cwd)
+        .into_iter()
+        .map(|wrapper_id| {
+            let path = cwd.join(PROJECT_WRAPPERS_DIR).join(&wrapper_id);
+            let layout_issue =
+                wrapper_install_layout_issue(&path).map(|issue| issue.message().to_string());
+            WrapperDiskEntry {
+                tracked: tracked_ids.contains(&wrapper_id),
+                experimental: github_releases::is_experimental_wrapper(edition, &wrapper_id),
+                known_for_edition: github_releases::has_wrapper_repo(edition, &wrapper_id),
+                id: wrapper_id,
+                path,
+                layout_issue,
+            }
+        })
+        .collect()
+}
+
+fn print_untracked_wrapper_warning(entry: &WrapperDiskEntry) {
+    let mut status = if let Some(issue) = entry.layout_issue.as_deref() {
+        format!(
+            "{}invalid layout on disk, not tracked in manifest: {issue}",
+            if entry.experimental {
+                "experimental, "
+            } else {
+                ""
+            }
+        )
+    } else {
+        format!(
+            "{}installed on disk, not tracked in manifest",
+            if entry.experimental {
+                "experimental, "
+            } else {
+                ""
+            }
+        )
+    };
+    if !entry.known_for_edition {
+        status.push_str("; not configured for this edition");
+    }
+    print_warn(&format!("wrapper/{}", entry.id), &status, &entry.path);
+}
+
 /// Prints active edition and resolved URLs for the current project.
 pub async fn status(
     paths: &Paths,
@@ -205,14 +280,16 @@ pub async fn status(
     }
 
     let project_manifest = load_project_manifest(&cwd).ok();
-    if let Some(m) = project_manifest.as_ref() {
-        if !m.wrappers.is_empty() {
-            println!(
-                "Wrappers installed: {}",
-                m.wrappers.keys().cloned().collect::<Vec<_>>().join(", ")
-            );
-        }
-    }
+    let wrapper_disk_entries = project_manifest
+        .as_ref()
+        .map(|manifest| discover_wrapper_disk_entries(&cwd, &project.edition, manifest))
+        .unwrap_or_else(|| {
+            discover_wrapper_disk_entries(
+                &cwd,
+                &project.edition,
+                &crate::config::ProjectManifest::default(),
+            )
+        });
 
     if verbose {
         println!();
@@ -334,8 +411,15 @@ pub async fn status(
         .as_ref()
         .map(|m| m.wrappers.clone())
         .unwrap_or_default();
+    let untracked_wrappers = wrapper_disk_entries
+        .iter()
+        .filter(|entry| entry.is_untracked())
+        .collect::<Vec<_>>();
     let configured_wrapper_ids = github_releases::wrapper_ids_for_edition(&project.edition);
-    if configured_wrapper_ids.is_empty() && installed_wrappers.is_empty() {
+    if configured_wrapper_ids.is_empty()
+        && installed_wrappers.is_empty()
+        && untracked_wrappers.is_empty()
+    {
         println!("wrapper: n/a (no wrappers configured)");
         return Ok(());
     }
@@ -344,6 +428,10 @@ pub async fn status(
         let instances = installed_wrappers
             .iter()
             .filter(|(instance_id, _)| github_releases::wrapper_base_id(instance_id) == wrapper_id)
+            .collect::<Vec<_>>();
+        let untracked_instances = untracked_wrappers
+            .iter()
+            .filter(|entry| github_releases::wrapper_base_id(&entry.id) == wrapper_id)
             .collect::<Vec<_>>();
         let latest = github_releases::latest_wrapper_from_releases(
             paths,
@@ -363,7 +451,9 @@ pub async fn status(
         match latest {
             Err(_) => {
                 if instances.is_empty() {
-                    println!("wrapper/{wrapper_id}: unknown (cannot check latest)");
+                    if untracked_instances.is_empty() {
+                        println!("wrapper/{wrapper_id}: unknown (cannot check latest)");
+                    }
                 } else {
                     for (instance_id, _current) in &instances {
                         println!("wrapper/{instance_id}: unknown (cannot check latest)");
@@ -372,7 +462,9 @@ pub async fn status(
             }
             Ok(None) => {
                 if instances.is_empty() {
-                    println!("wrapper/{wrapper_id}: no release yet");
+                    if untracked_instances.is_empty() {
+                        println!("wrapper/{wrapper_id}: no release yet");
+                    }
                 } else {
                     for (instance_id, _current) in &instances {
                         println!("wrapper/{instance_id}: installed, but no release available now");
@@ -381,10 +473,12 @@ pub async fn status(
             }
             Ok(Some(latest_bundle)) => {
                 if instances.is_empty() {
-                    println!(
-                        "wrapper/{wrapper_id}: not installed (run `{}`)",
-                        cmd_hint::run_cli(&format!("install wrapper {wrapper_id}"))
-                    );
+                    if untracked_instances.is_empty() {
+                        println!(
+                            "wrapper/{wrapper_id}: not installed (run `{}`)",
+                            cmd_hint::run_cli(&format!("install wrapper {wrapper_id}"))
+                        );
+                    }
                     continue;
                 }
                 for (instance_id, current) in &instances {
@@ -484,7 +578,47 @@ pub async fn status(
         }
     }
 
+    for entry in untracked_wrappers {
+        print_untracked_wrapper_status(entry);
+    }
+
     Ok(())
+}
+
+fn print_untracked_wrapper_status(entry: &WrapperDiskEntry) {
+    let experimental_prefix = if entry.experimental {
+        "experimental, "
+    } else {
+        ""
+    };
+    match entry.layout_issue.as_deref() {
+        Some(issue) => {
+            if entry.known_for_edition {
+                println!(
+                    "wrapper/{}: {}invalid layout on disk, not tracked in manifest: {}",
+                    entry.id, experimental_prefix, issue
+                );
+            } else {
+                println!(
+                    "wrapper/{}: {}invalid layout on disk, not tracked in manifest: {}; not configured for this edition",
+                    entry.id, experimental_prefix, issue
+                );
+            }
+        }
+        None => {
+            if entry.known_for_edition {
+                println!(
+                    "wrapper/{}: {}installed on disk, not tracked in manifest",
+                    entry.id, experimental_prefix
+                );
+            } else {
+                println!(
+                    "wrapper/{}: {}installed on disk, not tracked in manifest; not configured for this edition",
+                    entry.id, experimental_prefix
+                );
+            }
+        }
+    }
 }
 
 fn print_verbose_runtime(no_cache: bool, prerelease: bool) {

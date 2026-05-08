@@ -1039,24 +1039,47 @@ fn copy_dir_recursive(src: &Path, dst: &Path) -> Result<(), HackArenaError> {
     Ok(())
 }
 
-fn validate_wrapper_install_layout(
-    wrapper_id: &str,
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum WrapperInstallLayoutIssue {
+    MissingUserDir,
+    MissingManifest,
+}
+
+impl WrapperInstallLayoutIssue {
+    pub(crate) fn message(self) -> &'static str {
+        match self {
+            Self::MissingUserDir => "missing `user/` directory",
+            Self::MissingManifest => "missing `manifest.toml` (root) or `system/manifest.toml`",
+        }
+    }
+}
+
+pub(crate) fn wrapper_install_layout_issue(
     install_dir: &Path,
-) -> Result<(), HackArenaError> {
+) -> Option<WrapperInstallLayoutIssue> {
     let user_dir = install_dir.join("user");
     if !user_dir.is_dir() {
-        return Err(HackArenaError::msg(format!(
-            "Wrapper `{wrapper_id}` has invalid layout: missing `user/` directory in {}.",
-            install_dir.display()
-        )));
+        return Some(WrapperInstallLayoutIssue::MissingUserDir);
     }
 
     let has_manifest = ["manifest.toml", "system/manifest.toml"]
         .iter()
         .any(|rel| install_dir.join(rel).is_file());
     if !has_manifest {
+        return Some(WrapperInstallLayoutIssue::MissingManifest);
+    }
+
+    None
+}
+
+pub(crate) fn validate_wrapper_install_layout(
+    wrapper_id: &str,
+    install_dir: &Path,
+) -> Result<(), HackArenaError> {
+    if let Some(issue) = wrapper_install_layout_issue(install_dir) {
         return Err(HackArenaError::msg(format!(
-            "Wrapper `{wrapper_id}` has invalid layout: missing `manifest.toml` (root) or `system/manifest.toml` in {}.",
+            "Wrapper `{wrapper_id}` has invalid layout: {} in {}.",
+            issue.message(),
             install_dir.display()
         )));
     }
@@ -1849,7 +1872,7 @@ fn filename_from_url(url: &str) -> Option<String> {
         .filter(|s| !s.is_empty())
 }
 
-fn discover_installed_wrappers(cwd: &Path) -> Vec<String> {
+pub(crate) fn discover_installed_wrappers(cwd: &Path) -> Vec<String> {
     let dir = cwd.join(PROJECT_WRAPPERS_DIR);
     let mut out = Vec::new();
     if let Ok(rd) = std::fs::read_dir(dir) {
