@@ -314,15 +314,16 @@ pub async fn status(
         .and_then(|a| a.sha256.as_deref())
         .map(|s| s.to_string())
         .or_else(|| sha256_file_hex(&auth_path).ok());
+    let current_auth_version = current_auth_version_from_binary(&auth_path);
     let latest_auth = github_releases::latest_auth_from_releases(
         paths,
         &project.edition,
         no_cache,
         prerelease,
+        current_auth_version.as_deref(),
         None,
     )
     .await;
-    let current_auth_version = current_auth_version_from_binary(&auth_path);
     let latest_auth_version = latest_auth
         .as_ref()
         .ok()
@@ -355,17 +356,18 @@ pub async fn status(
     }
 
     // backend (project-local)
+    let current_backend = project_manifest.as_ref().and_then(|m| m.backend.as_ref());
+    let current_backend_version =
+        current_backend.and_then(|b| backend_version_from_asset_url(&b.url));
     let latest_backend = github_releases::latest_backend_from_releases(
         paths,
         &project.edition,
         no_cache,
         prerelease,
+        current_backend_version.as_deref(),
         None,
     )
     .await;
-    let current_backend = project_manifest.as_ref().and_then(|m| m.backend.as_ref());
-    let current_backend_version =
-        current_backend.and_then(|b| backend_version_from_asset_url(&b.url));
     let latest_backend_version = latest_backend
         .as_ref()
         .ok()
@@ -442,6 +444,7 @@ pub async fn status(
             no_cache,
             prerelease,
             None,
+            None,
         )
         .await;
         let latest_wrapper_version = latest
@@ -516,19 +519,20 @@ pub async fn status(
     for (wrapper_id, current) in installed_wrappers.iter().filter(|(wrapper_id, _)| {
         github_releases::is_experimental_wrapper(&project.edition, wrapper_id)
     }) {
+        let current_wrapper_version = wrapper_version_from_asset_url(
+            github_releases::wrapper_base_id(wrapper_id),
+            &current.url,
+        );
         let latest = github_releases::latest_wrapper_from_releases(
             paths,
             &project.edition,
             wrapper_id,
             no_cache,
             prerelease,
+            current_wrapper_version.as_deref(),
             None,
         )
         .await;
-        let current_wrapper_version = wrapper_version_from_asset_url(
-            github_releases::wrapper_base_id(wrapper_id),
-            &current.url,
-        );
         let latest_wrapper_version = latest
             .as_ref()
             .ok()
@@ -680,11 +684,7 @@ fn format_version_opt(version: Option<&str>) -> String {
 }
 
 fn normalize_version(version: &str) -> String {
-    version
-        .trim()
-        .trim_start_matches(['v', 'V'])
-        .trim()
-        .to_string()
+    github_releases::normalize_version_string(version)
 }
 
 fn current_auth_version_from_binary(auth_path: &Path) -> Option<String> {
@@ -735,119 +735,15 @@ fn looks_like_version_token(token: &str) -> bool {
 }
 
 fn auth_version_from_asset_url(url: &str) -> Option<String> {
-    let asset = asset_name_from_url(url)?;
-    let stem = strip_asset_extension(&asset);
-    let prefix = "ha-auth-v";
-    if !stem.to_ascii_lowercase().starts_with(prefix) {
-        return None;
-    }
-    let rest = &stem[prefix.len()..];
-    let version = strip_known_triple_suffix(rest);
-    let normalized = normalize_version(version);
-    if normalized.is_empty() {
-        None
-    } else {
-        Some(normalized)
-    }
+    github_releases::auth_version_from_asset_url(url)
 }
 
 fn backend_version_from_asset_url(url: &str) -> Option<String> {
-    let asset = asset_name_from_url(url)?;
-    let stem = strip_asset_extension(&asset);
-    let stem_lower = stem.to_ascii_lowercase();
-    if !stem_lower.contains("-backend-local-") {
-        return None;
-    }
-    let idx = stem_lower.rfind("-v")?;
-    let version = &stem[idx + 2..];
-    let normalized = normalize_version(version);
-    if normalized.is_empty() {
-        None
-    } else {
-        Some(normalized)
-    }
+    github_releases::backend_version_from_asset_url(url)
 }
 
 fn wrapper_version_from_asset_url(wrapper_id: &str, url: &str) -> Option<String> {
-    let asset = asset_name_from_url(url)?;
-    let stem = strip_asset_extension(&asset);
-    if wrapper_id.eq_ignore_ascii_case("typescript") {
-        let custom_prefix = "hackarena3-template-ts-v";
-        if stem.to_ascii_lowercase().starts_with(custom_prefix) {
-            let version = &stem[custom_prefix.len()..];
-            let normalized = normalize_version(version);
-            return (!normalized.is_empty()).then_some(normalized);
-        }
-    }
-    let prefix = format!("wrapper-{}-v", wrapper_id.to_ascii_lowercase());
-    if !stem.to_ascii_lowercase().starts_with(&prefix) {
-        return None;
-    }
-    let rest = &stem[prefix.len()..];
-    let version = strip_known_triple_suffix(rest);
-    let normalized = normalize_version(version);
-    if normalized.is_empty() {
-        None
-    } else {
-        Some(normalized)
-    }
-}
-
-fn asset_name_from_url(url: &str) -> Option<String> {
-    if let Some((_, query)) = url.split_once('?') {
-        for item in query.split('&') {
-            if let Some(name) = item.strip_prefix("asset_name=")
-                && !name.is_empty()
-            {
-                return Some(name.to_string());
-            }
-        }
-    }
-    url.split('?')
-        .next()
-        .unwrap_or(url)
-        .split('/')
-        .next_back()
-        .map(|s| s.to_string())
-        .filter(|s| !s.is_empty())
-}
-
-fn strip_asset_extension(asset: &str) -> &str {
-    if let Some(stem) = asset.strip_suffix(".tar.gz") {
-        return stem;
-    }
-    if let Some(stem) = asset.strip_suffix(".zip") {
-        return stem;
-    }
-    if let Some(stem) = asset.strip_suffix(".exe") {
-        return stem;
-    }
-    if let Some(stem) = asset.strip_suffix(".whl") {
-        return stem;
-    }
-    asset
-}
-
-fn strip_known_triple_suffix(value: &str) -> &str {
-    const TRIPLES: &[&str] = &[
-        "x86_64-pc-windows-msvc",
-        "aarch64-pc-windows-msvc",
-        "x86_64-unknown-linux-gnu",
-        "aarch64-unknown-linux-gnu",
-        "x86_64-unknown-linux-musl",
-        "aarch64-unknown-linux-musl",
-        "x86_64-apple-darwin",
-        "aarch64-apple-darwin",
-    ];
-
-    let value_lower = value.to_ascii_lowercase();
-    for triple in TRIPLES {
-        let suffix = format!("-{triple}");
-        if value_lower.ends_with(&suffix) {
-            return &value[..value.len().saturating_sub(suffix.len())];
-        }
-    }
-    value
+    github_releases::wrapper_version_from_asset_url(wrapper_id, url)
 }
 
 #[cfg(test)]

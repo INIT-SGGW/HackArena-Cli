@@ -38,7 +38,7 @@ pub enum Command {
         #[arg(long)]
         no_cache: bool,
 
-        /// Allow prerelease versions when stable release is not available.
+        /// Allow prerelease versions during release selection.
         #[arg(long)]
         prerelease: bool,
     },
@@ -67,7 +67,7 @@ pub enum Command {
         #[arg(long)]
         no_cache: bool,
 
-        /// Allow prerelease versions when stable release is not available.
+        /// Allow prerelease versions during release selection.
         #[arg(long)]
         prerelease: bool,
     },
@@ -124,7 +124,7 @@ pub enum Command {
         #[arg(long)]
         no_cache: bool,
 
-        /// Allow prerelease versions.
+        /// Allow prerelease versions during release selection.
         #[arg(long)]
         prerelease: bool,
 
@@ -177,7 +177,7 @@ pub enum InstallSubcommand {
         #[arg(long)]
         no_cache: bool,
 
-        /// Allow prerelease versions when stable release is not available.
+        /// Allow prerelease versions during release selection.
         #[arg(long)]
         prerelease: bool,
     },
@@ -188,7 +188,7 @@ pub enum InstallSubcommand {
         #[arg(long)]
         no_cache: bool,
 
-        /// Allow prerelease versions when stable release is not available.
+        /// Allow prerelease versions during release selection.
         #[arg(long)]
         prerelease: bool,
     },
@@ -206,7 +206,7 @@ pub enum InstallSubcommand {
         #[arg(long)]
         no_cache: bool,
 
-        /// Allow prerelease versions when stable release is not available.
+        /// Allow prerelease versions during release selection.
         #[arg(long)]
         prerelease: bool,
 
@@ -224,7 +224,7 @@ pub enum UpdateSubcommand {
         #[arg(long)]
         no_cache: bool,
 
-        /// Allow prerelease versions when stable release is not available.
+        /// Allow prerelease versions during release selection.
         #[arg(long)]
         prerelease: bool,
     },
@@ -235,7 +235,7 @@ pub enum UpdateSubcommand {
         #[arg(long)]
         no_cache: bool,
 
-        /// Allow prerelease versions when stable release is not available.
+        /// Allow prerelease versions during release selection.
         #[arg(long)]
         prerelease: bool,
     },
@@ -248,7 +248,7 @@ pub enum UpdateSubcommand {
         #[arg(long)]
         no_cache: bool,
 
-        /// Allow prerelease versions when stable release is not available.
+        /// Allow prerelease versions during release selection.
         #[arg(long)]
         prerelease: bool,
 

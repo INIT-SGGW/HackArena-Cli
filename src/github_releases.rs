@@ -5,6 +5,7 @@ use crate::config::{
 use crate::constants::{PROJECT_BACKEND_DIR, PROJECT_WRAPPERS_DIR};
 use crate::error::HackArenaError;
 use crate::github_http::{self, GITHUB_BINARY_ACCEPT, GITHUB_JSON_ACCEPT, GithubGetOutcome};
+use semver::Version;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
@@ -99,6 +100,13 @@ struct GithubCacheMeta {
 }
 
 #[derive(Debug, Clone)]
+struct InstallableRelease<T> {
+    release: GithubRelease,
+    version: Version,
+    value: T,
+}
+
+#[derive(Debug, Clone)]
 pub struct ResolvedReleaseAsset {
     pub name: String,
     pub url: String,
@@ -187,6 +195,7 @@ pub async fn load_edition_config_from_cache(
         &target,
         use_cache,
         allow_prerelease,
+        None,
     )
     .await?;
 
@@ -198,6 +207,7 @@ pub async fn load_edition_config_from_cache(
             &target,
             use_cache,
             allow_prerelease,
+            None,
         )
         .await?
         .map(|asset| BackendConfig {
@@ -216,6 +226,7 @@ pub async fn load_edition_config_from_cache(
             &target,
             use_cache,
             allow_prerelease,
+            None,
         )
         .await?
         {
@@ -251,12 +262,27 @@ pub async fn latest_auth_from_releases(
     edition: &str,
     no_cache: bool,
     prerelease: bool,
+    current_version: Option<&str>,
     linux_libc_override: Option<LinuxLibcMode>,
 ) -> Result<(String, String), HackArenaError> {
-    let cfg =
-        load_edition_config_from_cache(paths, edition, no_cache, prerelease, linux_libc_override)
-            .await?;
-    Ok((cfg.auth_artifact.filename, cfg.auth_artifact.sha256))
+    let repos = repos_for_edition(edition).ok_or_else(|| {
+        HackArenaError::msg(format!(
+            "GitHub Releases mapping is not configured for edition `{edition}`"
+        ))
+    })?;
+    let target = current_target_triples(linux_libc_override)?;
+    let use_cache = !no_cache;
+    let asset = resolve_required_component(
+        paths,
+        repos.auth_repo,
+        ComponentSelector::Auth,
+        &target,
+        use_cache,
+        prerelease,
+        current_version,
+    )
+    .await?;
+    Ok((asset.url, asset.sha256))
 }
 
 pub async fn latest_backend_from_releases(
@@ -264,19 +290,36 @@ pub async fn latest_backend_from_releases(
     edition: &str,
     no_cache: bool,
     prerelease: bool,
+    current_version: Option<&str>,
     linux_libc_override: Option<LinuxLibcMode>,
 ) -> Result<Option<ProjectInstalledBundle>, HackArenaError> {
-    let cfg =
-        load_edition_config_from_cache(paths, edition, no_cache, prerelease, linux_libc_override)
-            .await?;
-    let Some(backend) = cfg.backend.as_ref() else {
+    let repos = repos_for_edition(edition).ok_or_else(|| {
+        HackArenaError::msg(format!(
+            "GitHub Releases mapping is not configured for edition `{edition}`"
+        ))
+    })?;
+    let Some(repo) = repos.backend_repo else {
         return Ok(None);
     };
-    let BackendSource::Url { url } = &backend.source;
+    let target = current_target_triples(linux_libc_override)?;
+    let use_cache = !no_cache;
+    let Some(asset) = resolve_optional_component(
+        paths,
+        repo,
+        ComponentSelector::Backend,
+        &target,
+        use_cache,
+        prerelease,
+        current_version,
+    )
+    .await?
+    else {
+        return Ok(None);
+    };
     Ok(Some(ProjectInstalledBundle {
-        url: url.clone(),
+        url: asset.url,
         install_dir: PathBuf::from(PROJECT_BACKEND_DIR),
-        sha256: Some(backend.sha256.clone()),
+        sha256: Some(asset.sha256),
         installed_at_unix: None,
         files: vec![],
     }))
@@ -286,11 +329,24 @@ pub async fn latest_self_update_release_tag(
     paths: &Paths,
     no_cache: bool,
     prerelease: bool,
+    current_version: Option<&str>,
 ) -> Result<Option<String>, HackArenaError> {
+    let target = current_target_triples(None)?;
     Ok(
-        latest_self_update_repo_release(paths, !no_cache, prerelease)
-            .await?
-            .map(|release| release.tag_name),
+        match latest_installable_component_release(
+            paths,
+            HACKARENA_CLI_REPO,
+            ComponentSelector::HackArenaCli,
+            &target,
+            !no_cache,
+            prerelease,
+            current_version,
+        )
+        .await?
+        {
+            Some(candidate) => Some(candidate.release.tag_name),
+            None => None,
+        },
     )
 }
 
@@ -324,19 +380,32 @@ pub async fn latest_wrapper_from_releases(
     wrapper_id: &str,
     no_cache: bool,
     prerelease: bool,
+    current_version: Option<&str>,
     linux_libc_override: Option<LinuxLibcMode>,
 ) -> Result<Option<ProjectInstalledBundle>, HackArenaError> {
-    let cfg =
-        load_edition_config_from_cache(paths, edition, no_cache, prerelease, linux_libc_override)
-            .await?;
     let base_id = wrapper_base_id(wrapper_id);
-    let Some(wrapper) = cfg.wrapper(base_id) else {
+    let Some(repo) = wrapper_repo_for_edition(edition, base_id) else {
+        return Ok(None);
+    };
+    let target = current_target_triples(linux_libc_override)?;
+    let use_cache = !no_cache;
+    let Some(candidate) = latest_installable_component_release(
+        paths,
+        repo,
+        ComponentSelector::Wrapper(base_id),
+        &target,
+        use_cache,
+        prerelease,
+        current_version,
+    )
+    .await?
+    else {
         return Ok(None);
     };
     Ok(Some(ProjectInstalledBundle {
-        url: wrapper.filename.clone(),
+        url: candidate.value.url,
         install_dir: PathBuf::from(PROJECT_WRAPPERS_DIR).join(wrapper_id),
-        sha256: Some(wrapper.sha256.clone()),
+        sha256: Some(candidate.value.sha256),
         installed_at_unix: None,
         files: vec![],
     }))
@@ -383,6 +452,7 @@ pub async fn latest_wrapper_python_wheel_from_releases(
     wrapper_id: &str,
     no_cache: bool,
     prerelease: bool,
+    current_version: Option<&str>,
     linux_libc_override: Option<LinuxLibcMode>,
 ) -> Result<Option<ArtifactSpec>, HackArenaError> {
     let Some(repo) = wrapper_repo_for_edition(edition, wrapper_id) else {
@@ -391,12 +461,20 @@ pub async fn latest_wrapper_python_wheel_from_releases(
     let base_id = wrapper_base_id(wrapper_id);
     let use_cache = !no_cache;
     let target = current_target_triples(linux_libc_override)?;
-    let Some(release) = latest_release(paths, repo, use_cache, prerelease).await? else {
+    let Some(candidate) = latest_installable_python_wheel_release(
+        paths,
+        repo,
+        base_id,
+        &target,
+        use_cache,
+        prerelease,
+        current_version,
+    )
+    .await?
+    else {
         return Ok(None);
     };
-    resolve_python_wheel_from_release(paths, repo, base_id, &target, &release, use_cache)
-        .await
-        .map(Some)
+    Ok(Some(candidate.value))
 }
 
 pub async fn wrapper_python_wheel_from_release_tag(
@@ -427,6 +505,7 @@ pub async fn latest_wrapper_csharp_nupkg_from_releases(
     wrapper_id: &str,
     no_cache: bool,
     prerelease: bool,
+    current_version: Option<&str>,
     linux_libc_override: Option<LinuxLibcMode>,
 ) -> Result<Option<ArtifactSpec>, HackArenaError> {
     let Some(repo) = wrapper_repo_for_edition(edition, wrapper_id) else {
@@ -435,12 +514,20 @@ pub async fn latest_wrapper_csharp_nupkg_from_releases(
     let base_id = wrapper_base_id(wrapper_id);
     let use_cache = !no_cache;
     let target = current_target_triples(linux_libc_override)?;
-    let Some(release) = latest_release(paths, repo, use_cache, prerelease).await? else {
+    let Some(candidate) = latest_installable_csharp_nupkg_release(
+        paths,
+        repo,
+        base_id,
+        &target,
+        use_cache,
+        prerelease,
+        current_version,
+    )
+    .await?
+    else {
         return Ok(None);
     };
-    resolve_csharp_nupkg_from_release(paths, repo, base_id, &target, &release, use_cache)
-        .await
-        .map(Some)
+    Ok(Some(candidate.value))
 }
 
 pub async fn wrapper_csharp_nupkg_from_release_tag(
@@ -471,6 +558,7 @@ pub async fn latest_wrapper_cpp_sdk_from_releases(
     wrapper_id: &str,
     no_cache: bool,
     prerelease: bool,
+    current_version: Option<&str>,
     linux_libc_override: Option<LinuxLibcMode>,
 ) -> Result<Option<ArtifactSpec>, HackArenaError> {
     let Some(repo) = wrapper_repo_for_edition(edition, wrapper_id) else {
@@ -479,12 +567,20 @@ pub async fn latest_wrapper_cpp_sdk_from_releases(
     let base_id = wrapper_base_id(wrapper_id);
     let use_cache = !no_cache;
     let target = current_target_triples(linux_libc_override)?;
-    let Some(release) = latest_release(paths, repo, use_cache, prerelease).await? else {
+    let Some(candidate) = latest_installable_cpp_sdk_release(
+        paths,
+        repo,
+        base_id,
+        &target,
+        use_cache,
+        prerelease,
+        current_version,
+    )
+    .await?
+    else {
         return Ok(None);
     };
-    resolve_cpp_sdk_from_release(paths, repo, base_id, &target, &release, use_cache)
-        .await
-        .map(Some)
+    Ok(Some(candidate.value))
 }
 
 pub async fn wrapper_cpp_sdk_from_release_tag(
@@ -515,6 +611,7 @@ pub async fn latest_wrapper_typescript_tgz_from_releases(
     wrapper_id: &str,
     no_cache: bool,
     prerelease: bool,
+    current_version: Option<&str>,
     linux_libc_override: Option<LinuxLibcMode>,
 ) -> Result<Option<ArtifactSpec>, HackArenaError> {
     let Some(repo) = wrapper_repo_for_edition(edition, wrapper_id) else {
@@ -523,12 +620,20 @@ pub async fn latest_wrapper_typescript_tgz_from_releases(
     let base_id = wrapper_base_id(wrapper_id);
     let use_cache = !no_cache;
     let target = current_target_triples(linux_libc_override)?;
-    let Some(release) = latest_release(paths, repo, use_cache, prerelease).await? else {
+    let Some(candidate) = latest_installable_typescript_tgz_release(
+        paths,
+        repo,
+        base_id,
+        &target,
+        use_cache,
+        prerelease,
+        current_version,
+    )
+    .await?
+    else {
         return Ok(None);
     };
-    resolve_typescript_tgz_from_release(paths, repo, base_id, &target, &release, use_cache)
-        .await
-        .map(Some)
+    Ok(Some(candidate.value))
 }
 
 pub async fn wrapper_typescript_tgz_from_release_tag(
@@ -584,10 +689,18 @@ async fn resolve_required_component(
     target: &TargetTripleResolution,
     use_cache: bool,
     allow_prerelease: bool,
+    current_version: Option<&str>,
 ) -> Result<ResolvedReleaseAsset, HackArenaError> {
-    let Some(asset) =
-        resolve_optional_component(paths, repo, component, target, use_cache, allow_prerelease)
-            .await?
+    let Some(asset) = resolve_optional_component(
+        paths,
+        repo,
+        component,
+        target,
+        use_cache,
+        allow_prerelease,
+        current_version,
+    )
+    .await?
     else {
         return Err(HackArenaError::msg(format!(
             "No GitHub release found for {} in `{repo}`.",
@@ -604,13 +717,19 @@ async fn resolve_optional_component(
     target: &TargetTripleResolution,
     use_cache: bool,
     allow_prerelease: bool,
+    current_version: Option<&str>,
 ) -> Result<Option<ResolvedReleaseAsset>, HackArenaError> {
-    let Some(release) = latest_release(paths, repo, use_cache, allow_prerelease).await? else {
-        return Ok(None);
-    };
-    resolve_component_from_release(paths, repo, &release, component, target, use_cache)
-        .await
-        .map(Some)
+    Ok(latest_installable_component_release(
+        paths,
+        repo,
+        component,
+        target,
+        use_cache,
+        allow_prerelease,
+        current_version,
+    )
+    .await?
+    .map(|candidate| candidate.value))
 }
 
 async fn resolve_component_from_release(
@@ -623,6 +742,23 @@ async fn resolve_component_from_release(
 ) -> Result<ResolvedReleaseAsset, HackArenaError> {
     let checksums = fetch_release_checksums(paths, repo, release, use_cache).await?;
     resolve_component_from_release_with_checksums(repo, release, component, target, &checksums)
+}
+
+async fn try_resolve_component_from_release(
+    paths: &Paths,
+    repo: &str,
+    release: &GithubRelease,
+    component: ComponentSelector<'_>,
+    target: &TargetTripleResolution,
+    use_cache: bool,
+) -> Result<Option<ResolvedReleaseAsset>, HackArenaError> {
+    let Some(checksums) = try_fetch_release_checksums(paths, repo, release, use_cache).await?
+    else {
+        return Ok(None);
+    };
+    Ok(try_resolve_component_from_release_with_checksums(
+        release, component, target, &checksums,
+    ))
 }
 
 fn resolve_component_from_release_with_checksums(
@@ -641,6 +777,21 @@ fn resolve_component_from_release_with_checksums(
     })?;
 
     Ok(ResolvedReleaseAsset {
+        name: selected.name.clone(),
+        url: with_asset_name_hint(&selected.url, &selected.name),
+        sha256: expected_sha,
+    })
+}
+
+fn try_resolve_component_from_release_with_checksums(
+    release: &GithubRelease,
+    component: ComponentSelector<'_>,
+    target: &TargetTripleResolution,
+    checksums: &HashMap<String, String>,
+) -> Option<ResolvedReleaseAsset> {
+    let selected = try_select_component_asset(&release.assets, component, target)?;
+    let expected_sha = find_checksum_for_asset(checksums, &selected.name)?;
+    Some(ResolvedReleaseAsset {
         name: selected.name.clone(),
         url: with_asset_name_hint(&selected.url, &selected.name),
         sha256: expected_sha,
@@ -693,6 +844,47 @@ async fn resolve_python_wheel_from_release(
     })
 }
 
+async fn try_resolve_python_wheel_from_release(
+    paths: &Paths,
+    repo: &str,
+    wrapper_id: &str,
+    target: &TargetTripleResolution,
+    release: &GithubRelease,
+    use_cache: bool,
+) -> Result<Option<ArtifactSpec>, HackArenaError> {
+    let Some(checksums) = try_fetch_release_checksums(paths, repo, release, use_cache).await?
+    else {
+        return Ok(None);
+    };
+    let Some(wrapper_asset) = try_select_component_asset(
+        &release.assets,
+        ComponentSelector::Wrapper(wrapper_id),
+        target,
+    ) else {
+        return Ok(None);
+    };
+    let Some(wrapper_version) =
+        extract_wrapper_version_from_asset_name(&wrapper_asset.name, wrapper_id)
+    else {
+        return Ok(None);
+    };
+    let wheel_name = format!("hackarena3-{wrapper_version}-py3-none-any.whl");
+    let wheel_asset = release
+        .assets
+        .iter()
+        .find(|a| a.name.eq_ignore_ascii_case(&wheel_name));
+    let Some(wheel_asset) = wheel_asset else {
+        return Ok(None);
+    };
+    let Some(wheel_sha) = find_checksum_for_asset(&checksums, &wheel_asset.name) else {
+        return Ok(None);
+    };
+    Ok(Some(ArtifactSpec {
+        filename: with_asset_name_hint(&wheel_asset.url, &wheel_asset.name),
+        sha256: wheel_sha,
+    }))
+}
+
 async fn resolve_csharp_nupkg_from_release(
     paths: &Paths,
     repo: &str,
@@ -739,6 +931,47 @@ async fn resolve_csharp_nupkg_from_release(
     })
 }
 
+async fn try_resolve_csharp_nupkg_from_release(
+    paths: &Paths,
+    repo: &str,
+    wrapper_id: &str,
+    target: &TargetTripleResolution,
+    release: &GithubRelease,
+    use_cache: bool,
+) -> Result<Option<ArtifactSpec>, HackArenaError> {
+    let Some(checksums) = try_fetch_release_checksums(paths, repo, release, use_cache).await?
+    else {
+        return Ok(None);
+    };
+    let Some(wrapper_asset) = try_select_component_asset(
+        &release.assets,
+        ComponentSelector::Wrapper(wrapper_id),
+        target,
+    ) else {
+        return Ok(None);
+    };
+    let Some(wrapper_version) =
+        extract_wrapper_version_from_asset_name(&wrapper_asset.name, wrapper_id)
+    else {
+        return Ok(None);
+    };
+    let nupkg_name = format!("HackArena3.Wrapper.CSharp.{wrapper_version}.nupkg");
+    let nupkg_asset = release
+        .assets
+        .iter()
+        .find(|a| a.name.eq_ignore_ascii_case(&nupkg_name));
+    let Some(nupkg_asset) = nupkg_asset else {
+        return Ok(None);
+    };
+    let Some(nupkg_sha) = find_checksum_for_asset(&checksums, &nupkg_asset.name) else {
+        return Ok(None);
+    };
+    Ok(Some(ArtifactSpec {
+        filename: with_asset_name_hint(&nupkg_asset.url, &nupkg_asset.name),
+        sha256: nupkg_sha,
+    }))
+}
+
 async fn resolve_cpp_sdk_from_release(
     paths: &Paths,
     repo: &str,
@@ -762,6 +995,38 @@ async fn resolve_cpp_sdk_from_release(
             ))
         })?;
     resolve_cpp_sdk_asset(repo, release, &checksums, &wrapper_version, target)
+}
+
+async fn try_resolve_cpp_sdk_from_release(
+    paths: &Paths,
+    repo: &str,
+    wrapper_id: &str,
+    target: &TargetTripleResolution,
+    release: &GithubRelease,
+    use_cache: bool,
+) -> Result<Option<ArtifactSpec>, HackArenaError> {
+    let Some(checksums) = try_fetch_release_checksums(paths, repo, release, use_cache).await?
+    else {
+        return Ok(None);
+    };
+    let Some(wrapper_asset) = try_select_component_asset(
+        &release.assets,
+        ComponentSelector::Wrapper(wrapper_id),
+        target,
+    ) else {
+        return Ok(None);
+    };
+    let Some(wrapper_version) =
+        extract_wrapper_version_from_asset_name(&wrapper_asset.name, wrapper_id)
+    else {
+        return Ok(None);
+    };
+    Ok(try_resolve_cpp_sdk_asset(
+        release,
+        &checksums,
+        &wrapper_version,
+        target,
+    ))
 }
 
 async fn resolve_typescript_tgz_from_release(
@@ -788,6 +1053,37 @@ async fn resolve_typescript_tgz_from_release(
         })?;
 
     resolve_typescript_runtime_tgz_asset(repo, release, &checksums, &wrapper_version)
+}
+
+async fn try_resolve_typescript_tgz_from_release(
+    paths: &Paths,
+    repo: &str,
+    wrapper_id: &str,
+    target: &TargetTripleResolution,
+    release: &GithubRelease,
+    use_cache: bool,
+) -> Result<Option<ArtifactSpec>, HackArenaError> {
+    let Some(checksums) = try_fetch_release_checksums(paths, repo, release, use_cache).await?
+    else {
+        return Ok(None);
+    };
+    let Some(wrapper_asset) = try_select_component_asset(
+        &release.assets,
+        ComponentSelector::Wrapper(wrapper_id),
+        target,
+    ) else {
+        return Ok(None);
+    };
+    let Some(wrapper_version) =
+        extract_wrapper_version_from_asset_name(&wrapper_asset.name, wrapper_id)
+    else {
+        return Ok(None);
+    };
+    Ok(try_resolve_typescript_runtime_tgz_asset(
+        release,
+        &checksums,
+        &wrapper_version,
+    ))
 }
 
 fn resolve_cpp_sdk_asset(
@@ -834,6 +1130,26 @@ fn resolve_cpp_sdk_asset(
     })?;
 
     Ok(ArtifactSpec {
+        filename: with_asset_name_hint(&sdk_asset.url, &sdk_asset.name),
+        sha256: sdk_sha,
+    })
+}
+
+fn try_resolve_cpp_sdk_asset(
+    release: &GithubRelease,
+    checksums: &HashMap<String, String>,
+    wrapper_version: &str,
+    target: &TargetTripleResolution,
+) -> Option<ArtifactSpec> {
+    let candidates = cpp_sdk_asset_candidates(wrapper_version, &target.triples);
+    let sdk_asset = candidates.iter().find_map(|candidate| {
+        release
+            .assets
+            .iter()
+            .find(|asset| asset.name.eq_ignore_ascii_case(candidate))
+    })?;
+    let sdk_sha = find_checksum_for_asset(checksums, &sdk_asset.name)?;
+    Some(ArtifactSpec {
         filename: with_asset_name_hint(&sdk_asset.url, &sdk_asset.name),
         sha256: sdk_sha,
     })
@@ -889,6 +1205,28 @@ fn resolve_typescript_runtime_tgz_asset(
     })?;
 
     Ok(ArtifactSpec {
+        filename: with_asset_name_hint(&runtime_asset.url, &runtime_asset.name),
+        sha256: runtime_sha,
+    })
+}
+
+fn try_resolve_typescript_runtime_tgz_asset(
+    release: &GithubRelease,
+    checksums: &HashMap<String, String>,
+    wrapper_version: &str,
+) -> Option<ArtifactSpec> {
+    let runtime_name = format!("hackarena3-wrapper-ts-{wrapper_version}.tgz");
+    let matches = release
+        .assets
+        .iter()
+        .filter(|asset| asset.name.eq_ignore_ascii_case(&runtime_name))
+        .collect::<Vec<_>>();
+    if matches.len() != 1 {
+        return None;
+    }
+    let runtime_asset = matches[0];
+    let runtime_sha = find_checksum_for_asset(checksums, &runtime_asset.name)?;
+    Some(ArtifactSpec {
         filename: with_asset_name_hint(&runtime_asset.url, &runtime_asset.name),
         sha256: runtime_sha,
     })
@@ -968,26 +1306,186 @@ async fn fetch_release_checksums(
     parse_sha256_sums(&checksums_content)
 }
 
-async fn latest_release(
+async fn try_fetch_release_checksums(
     paths: &Paths,
     repo: &str,
+    release: &GithubRelease,
     use_cache: bool,
-    allow_prerelease: bool,
-) -> Result<Option<GithubRelease>, HackArenaError> {
-    let releases = fetch_release_list(paths, repo, use_cache).await?;
-    Ok(select_latest_release(&releases, allow_prerelease))
+) -> Result<Option<HashMap<String, String>>, HackArenaError> {
+    let Some(checksums_asset) = release
+        .assets
+        .iter()
+        .find(|a| a.name.eq_ignore_ascii_case(CHECKSUMS_ASSET_NAME))
+    else {
+        return Ok(None);
+    };
+
+    let cache_dir = cache_dir_for_repo_tag(paths, repo, &release.tag_name);
+    let data_path = cache_dir.join("checksums.txt");
+    let meta_path = cache_dir.join("checksums.meta.json");
+    let checksums_content = fetch_cached_text_resource(
+        paths,
+        &checksums_asset.url,
+        GITHUB_BINARY_ACCEPT,
+        use_cache,
+        &data_path,
+        &meta_path,
+        false,
+    )
+    .await?;
+    let Some(checksums_content) = checksums_content else {
+        return Ok(None);
+    };
+
+    Ok(parse_sha256_sums(&checksums_content).ok())
 }
 
-async fn latest_self_update_repo_release(
+async fn latest_installable_component_release(
     paths: &Paths,
+    repo: &str,
+    component: ComponentSelector<'_>,
+    target: &TargetTripleResolution,
     use_cache: bool,
     allow_prerelease: bool,
-) -> Result<Option<GithubRelease>, HackArenaError> {
-    let releases = fetch_release_list(paths, HACKARENA_CLI_REPO, use_cache).await?;
-    Ok(select_latest_self_update_release(
-        &releases,
-        allow_prerelease,
-    ))
+    current_version: Option<&str>,
+) -> Result<Option<InstallableRelease<ResolvedReleaseAsset>>, HackArenaError> {
+    let releases = fetch_release_list(paths, repo, use_cache).await?;
+    let mut candidates = Vec::new();
+    for release in sorted_release_candidates(&releases) {
+        let Some(version) = parse_release_version(&release.tag_name) else {
+            continue;
+        };
+        if let Some(asset) =
+            try_resolve_component_from_release(paths, repo, release, component, target, use_cache)
+                .await?
+        {
+            candidates.push(InstallableRelease {
+                release: release.clone(),
+                version,
+                value: asset,
+            });
+        }
+    }
+    Ok(select_installable_release(&candidates, allow_prerelease, current_version).cloned())
+}
+
+async fn latest_installable_python_wheel_release(
+    paths: &Paths,
+    repo: &str,
+    wrapper_id: &str,
+    target: &TargetTripleResolution,
+    use_cache: bool,
+    allow_prerelease: bool,
+    current_version: Option<&str>,
+) -> Result<Option<InstallableRelease<ArtifactSpec>>, HackArenaError> {
+    let releases = fetch_release_list(paths, repo, use_cache).await?;
+    let mut candidates = Vec::new();
+    for release in sorted_release_candidates(&releases) {
+        let Some(version) = parse_release_version(&release.tag_name) else {
+            continue;
+        };
+        if let Some(asset) = try_resolve_python_wheel_from_release(
+            paths, repo, wrapper_id, target, release, use_cache,
+        )
+        .await?
+        {
+            candidates.push(InstallableRelease {
+                release: release.clone(),
+                version,
+                value: asset,
+            });
+        }
+    }
+    Ok(select_installable_release(&candidates, allow_prerelease, current_version).cloned())
+}
+
+async fn latest_installable_csharp_nupkg_release(
+    paths: &Paths,
+    repo: &str,
+    wrapper_id: &str,
+    target: &TargetTripleResolution,
+    use_cache: bool,
+    allow_prerelease: bool,
+    current_version: Option<&str>,
+) -> Result<Option<InstallableRelease<ArtifactSpec>>, HackArenaError> {
+    let releases = fetch_release_list(paths, repo, use_cache).await?;
+    let mut candidates = Vec::new();
+    for release in sorted_release_candidates(&releases) {
+        let Some(version) = parse_release_version(&release.tag_name) else {
+            continue;
+        };
+        if let Some(asset) = try_resolve_csharp_nupkg_from_release(
+            paths, repo, wrapper_id, target, release, use_cache,
+        )
+        .await?
+        {
+            candidates.push(InstallableRelease {
+                release: release.clone(),
+                version,
+                value: asset,
+            });
+        }
+    }
+    Ok(select_installable_release(&candidates, allow_prerelease, current_version).cloned())
+}
+
+async fn latest_installable_cpp_sdk_release(
+    paths: &Paths,
+    repo: &str,
+    wrapper_id: &str,
+    target: &TargetTripleResolution,
+    use_cache: bool,
+    allow_prerelease: bool,
+    current_version: Option<&str>,
+) -> Result<Option<InstallableRelease<ArtifactSpec>>, HackArenaError> {
+    let releases = fetch_release_list(paths, repo, use_cache).await?;
+    let mut candidates = Vec::new();
+    for release in sorted_release_candidates(&releases) {
+        let Some(version) = parse_release_version(&release.tag_name) else {
+            continue;
+        };
+        if let Some(asset) =
+            try_resolve_cpp_sdk_from_release(paths, repo, wrapper_id, target, release, use_cache)
+                .await?
+        {
+            candidates.push(InstallableRelease {
+                release: release.clone(),
+                version,
+                value: asset,
+            });
+        }
+    }
+    Ok(select_installable_release(&candidates, allow_prerelease, current_version).cloned())
+}
+
+async fn latest_installable_typescript_tgz_release(
+    paths: &Paths,
+    repo: &str,
+    wrapper_id: &str,
+    target: &TargetTripleResolution,
+    use_cache: bool,
+    allow_prerelease: bool,
+    current_version: Option<&str>,
+) -> Result<Option<InstallableRelease<ArtifactSpec>>, HackArenaError> {
+    let releases = fetch_release_list(paths, repo, use_cache).await?;
+    let mut candidates = Vec::new();
+    for release in sorted_release_candidates(&releases) {
+        let Some(version) = parse_release_version(&release.tag_name) else {
+            continue;
+        };
+        if let Some(asset) = try_resolve_typescript_tgz_from_release(
+            paths, repo, wrapper_id, target, release, use_cache,
+        )
+        .await?
+        {
+            candidates.push(InstallableRelease {
+                release: release.clone(),
+                version,
+                value: asset,
+            });
+        }
+    }
+    Ok(select_installable_release(&candidates, allow_prerelease, current_version).cloned())
 }
 
 async fn release_by_tag(
@@ -1304,27 +1802,89 @@ fn now_unix_secs() -> Result<u64, HackArenaError> {
         .map_err(|err| HackArenaError::msg(format!("System clock error: {err}")))
 }
 
-fn select_latest_release(
-    releases: &[GithubRelease],
-    allow_prerelease: bool,
-) -> Option<GithubRelease> {
-    if let Some(stable) = releases.iter().find(|r| !r.draft && !r.prerelease) {
-        return Some(stable.clone());
-    }
-    if allow_prerelease {
-        return releases.iter().find(|r| !r.draft).cloned();
-    }
-    None
+fn sorted_release_candidates(releases: &[GithubRelease]) -> Vec<&GithubRelease> {
+    let mut candidates = releases
+        .iter()
+        .filter_map(|release| {
+            if release.draft {
+                return None;
+            }
+            Some((parse_release_version(&release.tag_name)?, release))
+        })
+        .collect::<Vec<_>>();
+    candidates.sort_by(|(left_version, _), (right_version, _)| right_version.cmp(left_version));
+    candidates.into_iter().map(|(_, release)| release).collect()
 }
 
-fn select_latest_self_update_release(
-    releases: &[GithubRelease],
+fn select_installable_release<'a, T>(
+    candidates: &'a [InstallableRelease<T>],
     allow_prerelease: bool,
-) -> Option<GithubRelease> {
+    current_version: Option<&str>,
+) -> Option<&'a InstallableRelease<T>> {
     if allow_prerelease {
-        return releases.iter().find(|r| !r.draft).cloned();
+        return candidates.first();
     }
-    select_latest_release(releases, false)
+
+    let latest_stable = candidates
+        .iter()
+        .find(|candidate| candidate.version.pre.is_empty());
+    let latest_prerelease = candidates
+        .iter()
+        .find(|candidate| !candidate.version.pre.is_empty());
+    let current_version = current_version.and_then(parse_release_version);
+
+    match current_version {
+        Some(current) if !current.pre.is_empty() => {
+            if let Some(stable) = latest_stable
+                && stable.version > current
+            {
+                return Some(stable);
+            }
+            latest_prerelease.or(latest_stable)
+        }
+        Some(_current) => latest_stable.or_else(|| {
+            if latest_stable.is_none() {
+                latest_prerelease
+            } else {
+                None
+            }
+        }),
+        None => latest_stable.or(latest_prerelease),
+    }
+}
+
+fn try_select_component_asset<'a>(
+    assets: &'a [GithubAsset],
+    component: ComponentSelector<'_>,
+    target: &TargetTripleResolution,
+) -> Option<&'a GithubAsset> {
+    select_component_asset(assets, component, target).ok()
+}
+
+pub fn parse_release_version(tag: &str) -> Option<Version> {
+    let normalized = normalize_release_version(tag)?;
+    Version::parse(&normalized).ok()
+}
+
+pub fn normalize_release_version(tag: &str) -> Option<String> {
+    let trimmed = tag.trim().trim_start_matches(['v', 'V']).trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    if let Ok(version) = Version::parse(trimmed) {
+        return Some(version.to_string());
+    }
+
+    let legacy_beta_index = trimmed.rfind('b')?;
+    let base = &trimmed[..legacy_beta_index];
+    let beta_number = &trimmed[legacy_beta_index + 1..];
+    if beta_number.is_empty() || !beta_number.chars().all(|ch| ch.is_ascii_digit()) {
+        return None;
+    }
+    let candidate = format!("{base}-beta.{beta_number}");
+    Version::parse(&candidate)
+        .ok()
+        .map(|version| version.to_string())
 }
 
 fn select_component_asset<'a>(
@@ -1993,16 +2553,139 @@ fn with_asset_name_hint(url: &str, asset_name: &str) -> String {
     format!("{url}{sep}asset_name={asset_name}")
 }
 
+pub fn normalize_version_string(version: &str) -> String {
+    version
+        .trim()
+        .trim_start_matches(['v', 'V'])
+        .trim()
+        .to_string()
+}
+
+pub fn auth_version_from_asset_url(url: &str) -> Option<String> {
+    let asset = asset_name_from_url(url)?;
+    let stem = strip_asset_extension(&asset);
+    let prefix = "ha-auth-v";
+    if !stem.to_ascii_lowercase().starts_with(prefix) {
+        return None;
+    }
+    let rest = &stem[prefix.len()..];
+    let version = strip_known_triple_suffix(rest);
+    let normalized = normalize_version_string(version);
+    if normalized.is_empty() {
+        None
+    } else {
+        Some(normalized)
+    }
+}
+
+pub fn backend_version_from_asset_url(url: &str) -> Option<String> {
+    let asset = asset_name_from_url(url)?;
+    let stem = strip_asset_extension(&asset);
+    let stem_lower = stem.to_ascii_lowercase();
+    if !stem_lower.contains("-backend-local-") {
+        return None;
+    }
+    let idx = stem_lower.rfind("-v")?;
+    let version = &stem[idx + 2..];
+    let normalized = normalize_version_string(version);
+    if normalized.is_empty() {
+        None
+    } else {
+        Some(normalized)
+    }
+}
+
+pub fn wrapper_version_from_asset_url(wrapper_id: &str, url: &str) -> Option<String> {
+    let asset = asset_name_from_url(url)?;
+    let stem = strip_asset_extension(&asset);
+    if wrapper_id.eq_ignore_ascii_case("typescript") {
+        let custom_prefix = "hackarena3-template-ts-v";
+        if stem.to_ascii_lowercase().starts_with(custom_prefix) {
+            let version = &stem[custom_prefix.len()..];
+            let normalized = normalize_version_string(version);
+            return (!normalized.is_empty()).then_some(normalized);
+        }
+    }
+    let prefix = format!("wrapper-{}-v", wrapper_id.to_ascii_lowercase());
+    if !stem.to_ascii_lowercase().starts_with(&prefix) {
+        return None;
+    }
+    let rest = &stem[prefix.len()..];
+    let version = strip_known_triple_suffix(rest);
+    let normalized = normalize_version_string(version);
+    if normalized.is_empty() {
+        None
+    } else {
+        Some(normalized)
+    }
+}
+
+pub fn asset_name_from_url(url: &str) -> Option<String> {
+    if let Some((_, query)) = url.split_once('?') {
+        for item in query.split('&') {
+            if let Some(name) = item.strip_prefix("asset_name=")
+                && !name.is_empty()
+            {
+                return Some(name.to_string());
+            }
+        }
+    }
+    url.split('?')
+        .next()
+        .unwrap_or(url)
+        .split('/')
+        .next_back()
+        .map(|s| s.to_string())
+        .filter(|s| !s.is_empty())
+}
+
+fn strip_asset_extension(asset: &str) -> &str {
+    if let Some(stem) = asset.strip_suffix(".tar.gz") {
+        return stem;
+    }
+    if let Some(stem) = asset.strip_suffix(".zip") {
+        return stem;
+    }
+    if let Some(stem) = asset.strip_suffix(".exe") {
+        return stem;
+    }
+    if let Some(stem) = asset.strip_suffix(".whl") {
+        return stem;
+    }
+    asset
+}
+
+fn strip_known_triple_suffix(value: &str) -> &str {
+    let known_suffixes = [
+        "-x86_64-pc-windows-msvc",
+        "-aarch64-pc-windows-msvc",
+        "-x86_64-unknown-linux-gnu",
+        "-x86_64-unknown-linux-musl",
+        "-aarch64-unknown-linux-gnu",
+        "-aarch64-unknown-linux-musl",
+        "-x86_64-apple-darwin",
+        "-aarch64-apple-darwin",
+    ];
+    for suffix in known_suffixes {
+        if let Some(stripped) = value.strip_suffix(suffix) {
+            return stripped;
+        }
+    }
+    value
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
-        ComponentSelector, GithubAsset, GithubRelease, LinuxLibcMode, TargetTripleResolution,
-        cpp_sdk_asset_candidates, experimental_wrapper_ids_for_edition,
+        ComponentSelector, GithubAsset, GithubRelease, InstallableRelease, LinuxLibcMode,
+        TargetTripleResolution, cpp_sdk_asset_candidates, experimental_wrapper_ids_for_edition,
         extract_wrapper_version_from_asset_name, has_wrapper_repo, is_component_asset,
-        is_experimental_wrapper, linux_target_triples_for_arch, parse_sha256_sums,
-        resolve_cpp_sdk_asset, resolve_linux_mode_from_inputs,
-        resolve_typescript_runtime_tgz_asset, select_component_asset, select_latest_release,
-        select_latest_self_update_release, wrapper_base_id, wrapper_ids_for_edition,
+        is_experimental_wrapper, linux_target_triples_for_arch, normalize_release_version,
+        parse_release_version, parse_sha256_sums, resolve_cpp_sdk_asset,
+        resolve_linux_mode_from_inputs, resolve_typescript_runtime_tgz_asset,
+        select_component_asset, select_installable_release,
+        try_resolve_component_from_release_with_checksums,
+        try_resolve_typescript_runtime_tgz_asset, wrapper_base_id, wrapper_ids_for_edition,
     };
     use std::collections::HashMap;
 
@@ -2018,6 +2701,20 @@ mod tests {
         TargetTripleResolution {
             triples: triples.to_vec(),
             linux_details: None,
+        }
+    }
+
+    fn candidate(tag: &str) -> InstallableRelease<()> {
+        InstallableRelease {
+            release: GithubRelease {
+                tag_name: tag.to_string(),
+                name: tag.to_string(),
+                draft: false,
+                prerelease: tag.contains("beta") || tag.contains('b'),
+                assets: vec![],
+            },
+            version: parse_release_version(tag).expect("version"),
+            value: (),
         }
     }
 
@@ -2488,65 +3185,184 @@ bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb *ha3-backend-lo
     }
 
     #[test]
-    fn release_selection_is_stable_only_without_flag() {
-        let prerelease = GithubRelease {
-            tag_name: "v0.1.0-beta.1".to_string(),
-            name: "beta".to_string(),
-            draft: false,
-            prerelease: true,
-            assets: vec![],
-        };
-        let stable = GithubRelease {
-            tag_name: "v0.1.0".to_string(),
-            name: "stable".to_string(),
+    fn release_version_parsing_and_ordering_supports_legacy_and_semver_beta_tags() {
+        let versions = ["0.1.0b8", "0.1.0", "0.2.0-beta.1", "0.2.0", "0.3.0-beta.1"]
+            .into_iter()
+            .map(|value| parse_release_version(value).expect("version"))
+            .collect::<Vec<_>>();
+        assert!(versions[0] < versions[1]);
+        assert!(versions[1] < versions[2]);
+        assert!(versions[2] < versions[3]);
+        assert!(versions[3] < versions[4]);
+        assert_eq!(
+            normalize_release_version("v0.1.0b8").as_deref(),
+            Some("0.1.0-beta.8")
+        );
+    }
+
+    #[test]
+    fn prerelease_policy_without_flag_upgrades_prerelease_when_no_newer_stable_exists() {
+        let candidates = vec![candidate("v0.2.0-beta.3")];
+        let selected = select_installable_release(&candidates, false, Some("0.2.0-beta.2"))
+            .expect("candidate");
+        assert_eq!(selected.release.tag_name, "v0.2.0-beta.3");
+    }
+
+    #[test]
+    fn prerelease_policy_prefers_newer_stable_without_flag_and_newer_prerelease_with_flag() {
+        let candidates = vec![candidate("v0.3.0-beta.1"), candidate("v0.2.0")];
+        let selected = select_installable_release(&candidates, false, Some("0.2.0-beta.2"))
+            .expect("stable candidate");
+        assert_eq!(selected.release.tag_name, "v0.2.0");
+
+        let selected = select_installable_release(&candidates, true, Some("0.2.0-beta.2"))
+            .expect("prerelease candidate");
+        assert_eq!(selected.release.tag_name, "v0.3.0-beta.1");
+    }
+
+    #[test]
+    fn prerelease_policy_does_not_jump_stable_install_to_newer_prerelease_without_flag() {
+        let candidates = vec![candidate("v0.3.0-beta.1"), candidate("v0.2.0")];
+        let selected = select_installable_release(&candidates, false, Some("0.2.0"))
+            .expect("stable candidate");
+        assert_eq!(selected.release.tag_name, "v0.2.0");
+
+        let selected = select_installable_release(&candidates, true, Some("0.2.0"))
+            .expect("prerelease candidate");
+        assert_eq!(selected.release.tag_name, "v0.3.0-beta.1");
+    }
+
+    #[test]
+    fn installable_component_scanning_skips_newest_release_without_matching_asset() {
+        let newest = GithubRelease {
+            tag_name: "v0.2.0".to_string(),
+            name: "newest".to_string(),
             draft: false,
             prerelease: false,
             assets: vec![],
         };
-
-        let selected = select_latest_release(&[stable.clone(), prerelease.clone()], false)
-            .expect("release should be selected");
-        assert_eq!(selected.tag_name, "v0.1.0");
-
-        let selected = select_latest_release(&[prerelease], false);
-        assert!(selected.is_none());
+        let older = GithubRelease {
+            tag_name: "v0.1.0".to_string(),
+            name: "older".to_string(),
+            draft: false,
+            prerelease: false,
+            assets: vec![asset("ha-auth-v0.1.0-x86_64-pc-windows-msvc.exe")],
+        };
+        let checksums = HashMap::from([(
+            "ha-auth-v0.1.0-x86_64-pc-windows-msvc.exe".to_string(),
+            "older".to_string(),
+        )]);
+        let target = target(&["x86_64-pc-windows-msvc"]);
+        let mut candidates = Vec::new();
+        for release in super::sorted_release_candidates(&[newest, older]) {
+            if let Some(asset) = try_resolve_component_from_release_with_checksums(
+                release,
+                ComponentSelector::Auth,
+                &target,
+                &checksums,
+            ) {
+                candidates.push(InstallableRelease {
+                    release: release.clone(),
+                    version: parse_release_version(&release.tag_name).expect("version"),
+                    value: asset,
+                });
+            }
+        }
+        let selected = select_installable_release(&candidates, false, None).expect("older");
+        assert_eq!(selected.release.tag_name, "v0.1.0");
     }
 
     #[test]
-    fn release_selection_allows_prerelease_with_flag() {
-        let prerelease = GithubRelease {
-            tag_name: "v0.1.0-beta.1".to_string(),
-            name: "beta".to_string(),
+    fn installable_component_scanning_skips_release_without_checksum() {
+        let newest = GithubRelease {
+            tag_name: "v0.2.0".to_string(),
+            name: "newest".to_string(),
+            draft: false,
+            prerelease: false,
+            assets: vec![asset("ha-auth-v0.2.0-x86_64-pc-windows-msvc.exe")],
+        };
+        let older = GithubRelease {
+            tag_name: "v0.1.0".to_string(),
+            name: "older".to_string(),
+            draft: false,
+            prerelease: false,
+            assets: vec![asset("ha-auth-v0.1.0-x86_64-pc-windows-msvc.exe")],
+        };
+        let target = target(&["x86_64-pc-windows-msvc"]);
+        let newest_checksums = HashMap::new();
+        let older_checksums = HashMap::from([(
+            "ha-auth-v0.1.0-x86_64-pc-windows-msvc.exe".to_string(),
+            "older".to_string(),
+        )]);
+        let mut candidates = Vec::new();
+        for (release, checksums) in [(&newest, &newest_checksums), (&older, &older_checksums)] {
+            if let Some(asset) = try_resolve_component_from_release_with_checksums(
+                release,
+                ComponentSelector::Auth,
+                &target,
+                checksums,
+            ) {
+                candidates.push(InstallableRelease {
+                    release: release.clone(),
+                    version: parse_release_version(&release.tag_name).expect("version"),
+                    value: asset,
+                });
+            }
+        }
+        let selected = select_installable_release(&candidates, false, None).expect("older");
+        assert_eq!(selected.release.tag_name, "v0.1.0");
+    }
+
+    #[test]
+    fn installable_runtime_scanning_skips_release_without_required_runtime_package() {
+        let newest = GithubRelease {
+            tag_name: "v0.2.0-beta.2".to_string(),
+            name: "newest".to_string(),
             draft: false,
             prerelease: true,
-            assets: vec![],
+            assets: vec![asset("wrapper-typescript-v0.2.0-beta.2.zip")],
         };
-
-        let selected =
-            select_latest_release(&[prerelease], true).expect("fallback should select beta");
-        assert_eq!(selected.tag_name, "v0.1.0-beta.1");
-    }
-
-    #[test]
-    fn self_update_release_selection_prefers_prerelease_when_requested() {
-        let prerelease = GithubRelease {
+        let older = GithubRelease {
             tag_name: "v0.2.0-beta.1".to_string(),
-            name: "beta".to_string(),
+            name: "older".to_string(),
             draft: false,
             prerelease: true,
-            assets: vec![],
+            assets: vec![
+                asset("wrapper-typescript-v0.2.0-beta.1.zip"),
+                asset("hackarena3-wrapper-ts-0.2.0-beta.1.tgz"),
+            ],
         };
-        let stable = GithubRelease {
-            tag_name: "v0.1.0".to_string(),
-            name: "stable".to_string(),
-            draft: false,
-            prerelease: false,
-            assets: vec![],
-        };
-
-        let selected = select_latest_self_update_release(&[prerelease, stable], true)
-            .expect("self-update should select beta");
-        assert_eq!(selected.tag_name, "v0.2.0-beta.1");
+        let checksums = HashMap::from([(
+            "hackarena3-wrapper-ts-0.2.0-beta.1.tgz".to_string(),
+            "runtime".to_string(),
+        )]);
+        let mut candidates = Vec::new();
+        for release in super::sorted_release_candidates(&[newest, older]) {
+            let Some(wrapper_asset) = super::try_select_component_asset(
+                &release.assets,
+                ComponentSelector::Wrapper("typescript"),
+                &target(&["x86_64-pc-windows-msvc"]),
+            ) else {
+                continue;
+            };
+            let Some(wrapper_version) =
+                extract_wrapper_version_from_asset_name(&wrapper_asset.name, "typescript")
+            else {
+                continue;
+            };
+            if let Some(asset) =
+                try_resolve_typescript_runtime_tgz_asset(release, &checksums, &wrapper_version)
+            {
+                candidates.push(InstallableRelease {
+                    release: release.clone(),
+                    version: parse_release_version(&release.tag_name).expect("version"),
+                    value: asset,
+                });
+            }
+        }
+        let selected =
+            select_installable_release(&candidates, true, Some("0.2.0-beta.0")).expect("older");
+        assert_eq!(selected.release.tag_name, "v0.2.0-beta.1");
     }
 
     #[test]

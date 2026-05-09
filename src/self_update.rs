@@ -39,20 +39,26 @@ pub async fn self_update(
     tag: Option<&str>,
 ) -> Result<(), HackArenaError> {
     let current_exe = std::env::current_exe().map_err(HackArenaError::Io)?;
-    let current_version = Version::parse(env!("CARGO_PKG_VERSION")).map_err(|err| {
-        HackArenaError::msg(format!(
-            "Current CLI version `{}` is not valid semver: {err}",
-            env!("CARGO_PKG_VERSION")
-        ))
-    })?;
+    let current_version = github_releases::parse_release_version(env!("CARGO_PKG_VERSION"))
+        .ok_or_else(|| {
+            HackArenaError::msg(format!(
+                "Current CLI version `{}` is not a supported release version.",
+                env!("CARGO_PKG_VERSION")
+            ))
+        })?;
 
     prepare_self_update_storage(paths)?;
 
     let target_tag = if let Some(tag) = tag {
         tag.to_string()
     } else {
-        let Some(tag_name) =
-            github_releases::latest_self_update_release_tag(paths, no_cache, prerelease).await?
+        let Some(tag_name) = github_releases::latest_self_update_release_tag(
+            paths,
+            no_cache,
+            prerelease,
+            Some(env!("CARGO_PKG_VERSION")),
+        )
+        .await?
         else {
             return Err(HackArenaError::msg(
                 "No GitHub release is available for `hackarena-cli`.",
@@ -244,9 +250,9 @@ fn prepare_self_update_storage(paths: &Paths) -> Result<(), HackArenaError> {
 }
 
 fn parse_release_version(tag: &str) -> Result<Version, HackArenaError> {
-    Version::parse(tag.trim_start_matches('v')).map_err(|err| {
+    github_releases::parse_release_version(tag).ok_or_else(|| {
         HackArenaError::msg(format!(
-            "Release tag `{tag}` is not valid semver for self-update: {err}"
+            "Release tag `{tag}` is not a supported version for self-update."
         ))
     })
 }

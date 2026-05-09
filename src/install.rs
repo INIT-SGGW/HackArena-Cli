@@ -1,9 +1,10 @@
 use crate::archive::{ensure_executable, extract_archive, recreate_dir};
 use crate::cmd_hint;
 use crate::config::{
-    EditionConfig, Paths, ProjectConfig, ProjectInstalledBinary, ProjectInstalledBundle,
-    ProjectManifest, ensure_dir, is_project_dir, load_project_config, load_project_manifest,
-    project_meta_dir, save_project_config, save_project_manifest, validate_edition,
+    BackendConfig, BackendSource, EditionConfig, Paths, ProjectConfig, ProjectInstalledBinary,
+    ProjectInstalledBundle, ProjectManifest, ensure_dir, is_project_dir, load_project_config,
+    load_project_manifest, project_meta_dir, save_project_config, save_project_manifest,
+    validate_edition,
 };
 use crate::constants::{PROJECT_BACKEND_DIR, PROJECT_WRAPPERS_DIR};
 use crate::download::{download_to_cache, sha256_file_hex};
@@ -259,14 +260,43 @@ pub async fn update_auth(
     let config = load_effective_config(paths, &project, no_cache, prerelease, linux_libc).await?;
 
     let auth_path = paths.bin_dir.join(&config.bin_name_auth);
+    let current_auth_version = current_auth_version_from_binary(&auth_path);
     let current_sha = sha256_file_hex(&auth_path).ok();
     if let Some(current) = current_sha.as_deref() {
-        if current.eq_ignore_ascii_case(&config.auth_artifact.sha256) {
+        let (latest_url, latest_sha) = github_releases::latest_auth_from_releases(
+            paths,
+            &project.edition,
+            no_cache,
+            prerelease,
+            current_auth_version.as_deref(),
+            linux_libc,
+        )
+        .await?;
+        if current.eq_ignore_ascii_case(&latest_sha) {
             println!("ha-auth is already up to date.");
             return Ok(());
         }
+        let cache_filename =
+            filename_from_url(&latest_url).unwrap_or_else(|| config.bin_name_auth.clone());
+        if auth_path.exists() {
+            tokio::fs::remove_file(&auth_path)
+                .await
+                .map_err(|e| HackArenaError::io_with_path(&auth_path, e))?;
+        }
+        ensure_dir(&paths.bin_dir)?;
+        ensure_dir(&paths.downloads_cache_dir())?;
+        let cached = download_to_cache(paths, &latest_url, &cache_filename, &latest_sha).await?;
+        println!("Installing auth...");
+        if is_archive_path(&cached) {
+            let tmp = extract_to_temp_dir(paths, &cached)?;
+            let extracted = find_extracted_file(tmp.path(), &config.bin_name_auth)?;
+            install_file_atomic(&extracted, &auth_path)?;
+        } else {
+            install_file_atomic(&cached, &auth_path)?;
+        }
+        ensure_executable(&auth_path)?;
+        return Ok(());
     }
-
     // Re-install is safe: installer skips if file exists, so delete first when updating.
     if auth_path.exists() {
         tokio::fs::remove_file(&auth_path)
@@ -296,18 +326,41 @@ pub async fn update_backend(
     validate_edition(&project.edition)?;
     let mut config =
         load_effective_config(paths, &project, no_cache, prerelease, linux_libc).await?;
-    if config.backend.is_none() {
+    let current_project_manifest = load_project_manifest(&cwd).unwrap_or_default();
+    let current_backend_version = current_project_manifest
+        .backend
+        .as_ref()
+        .and_then(|b| github_releases::backend_version_from_asset_url(&b.url));
+    let latest_backend = github_releases::latest_backend_from_releases(
+        paths,
+        &project.edition,
+        no_cache,
+        prerelease,
+        current_backend_version.as_deref(),
+        linux_libc,
+    )
+    .await?;
+    if latest_backend.is_none() {
         return Err(HackArenaError::msg(format!(
             "No backend release is available yet for edition `{}`.",
             project.edition
         )));
     }
-
-    let current_project_manifest = load_project_manifest(&cwd).unwrap_or_default();
-    // Compare against the backend pinned by the cached/latest GitHub release metadata.
+    if let Some(expected) = latest_backend.as_ref() {
+        let sha256 = expected.sha256.clone().ok_or_else(|| {
+            HackArenaError::msg("Resolved backend release is missing SHA256 metadata.")
+        })?;
+        config.backend = Some(BackendConfig {
+            source: BackendSource::Url {
+                url: expected.url.clone(),
+            },
+            sha256,
+        });
+    }
+    // Compare against the backend pinned by the smarter release resolver.
     if let (Some(current), Some(expected)) = (
         current_project_manifest.backend.as_ref(),
-        resolve_project_backend_manifest(&config).await?,
+        latest_backend.clone(),
     ) {
         let current_sha = current.sha256.as_deref();
         let expected_sha = expected.sha256.as_deref();
@@ -332,7 +385,7 @@ pub async fn update_backend(
     }
 
     let mut manifest = load_project_manifest(&cwd)?;
-    manifest.backend = resolve_project_backend_manifest(&config).await?;
+    manifest.backend = latest_backend;
     save_project_manifest(&cwd, &manifest)?;
 
     Ok(())
@@ -459,14 +512,14 @@ pub async fn install_wrapper(
         }
     }
     let wrapper_dir = wrappers_root.join(&target_wrapper_id);
-    let (wrapper_url, wrapper_sha) = resolve_wrapper_target(
+    let (wrapper_url, wrapper_sha, selected_release_tag) = resolve_wrapper_target(
         paths,
         &project,
-        &config,
         &managed_wrapper_id,
         no_cache,
         prerelease,
         release_tag,
+        None,
         linux_libc,
     )
     .await?;
@@ -498,7 +551,7 @@ pub async fn install_wrapper(
         no_cache,
         prerelease,
         preserve_existing_user,
-        release_tag,
+        selected_release_tag.as_deref(),
         &wrapper_url,
         &wrapper_sha,
         linux_libc,
@@ -547,16 +600,21 @@ pub async fn update_wrapper(
         )));
     }
 
-    let config = load_effective_config(paths, &project, no_cache, prerelease, linux_libc).await?;
     let managed_wrapper_id = github_releases::wrapper_base_id(wrapper_id).to_string();
-    let (wrapper_url, wrapper_sha) = resolve_wrapper_target(
+    let current_wrapper_version = load_project_manifest(&cwd)
+        .ok()
+        .and_then(|manifest| manifest.wrappers.get(wrapper_id).cloned())
+        .and_then(|bundle| {
+            github_releases::wrapper_version_from_asset_url(&managed_wrapper_id, &bundle.url)
+        });
+    let (wrapper_url, wrapper_sha, selected_release_tag) = resolve_wrapper_target(
         paths,
         &project,
-        &config,
         &managed_wrapper_id,
         no_cache,
         prerelease,
         release_tag,
+        current_wrapper_version.as_deref(),
         linux_libc,
     )
     .await?;
@@ -578,7 +636,7 @@ pub async fn update_wrapper(
         no_cache,
         prerelease,
         true,
-        release_tag,
+        selected_release_tag.as_deref(),
         &wrapper_url,
         &wrapper_sha,
         linux_libc,
@@ -602,13 +660,13 @@ pub async fn update_wrapper(
 async fn resolve_wrapper_target(
     paths: &Paths,
     project: &ProjectConfig,
-    config: &EditionConfig,
     managed_wrapper_id: &str,
     no_cache: bool,
-    _prerelease: bool,
+    prerelease: bool,
     release_tag: Option<&str>,
+    current_version: Option<&str>,
     linux_libc: Option<LinuxLibcMode>,
-) -> Result<(String, String), HackArenaError> {
+) -> Result<(String, String, Option<String>), HackArenaError> {
     if let Some(tag) = release_tag {
         if !github_releases::has_wrapper_repo(&project.edition, managed_wrapper_id) {
             return Err(HackArenaError::UnknownWrapper(
@@ -634,20 +692,81 @@ async fn resolve_wrapper_target(
                 "Wrapper `{managed_wrapper_id}` release `{tag}` is missing SHA256 metadata."
             ))
         })?;
-        return Ok((bundle.url, sha));
+        return Ok((bundle.url, sha, Some(tag.to_string())));
     }
 
-    let Some(wrapper) = config.wrapper(managed_wrapper_id) else {
-        if github_releases::has_wrapper_repo(&project.edition, managed_wrapper_id) {
-            return Err(HackArenaError::msg(format!(
-                "No GitHub release for wrapper `{managed_wrapper_id}` yet."
-            )));
-        }
+    if !github_releases::has_wrapper_repo(&project.edition, managed_wrapper_id) {
         return Err(HackArenaError::UnknownWrapper(
             managed_wrapper_id.to_string(),
         ));
+    }
+    let Some(bundle) = github_releases::latest_wrapper_from_releases(
+        paths,
+        &project.edition,
+        managed_wrapper_id,
+        no_cache,
+        prerelease,
+        current_version,
+        linux_libc,
+    )
+    .await?
+    else {
+        return Err(HackArenaError::msg(format!(
+            "No GitHub release for wrapper `{managed_wrapper_id}` yet."
+        )));
     };
-    Ok((wrapper.filename.clone(), wrapper.sha256.clone()))
+    let sha = bundle.sha256.clone().ok_or_else(|| {
+        HackArenaError::msg(format!(
+            "Wrapper `{managed_wrapper_id}` is missing SHA256 metadata."
+        ))
+    })?;
+    Ok((bundle.url, sha, None))
+}
+
+fn current_auth_version_from_binary(auth_path: &Path) -> Option<String> {
+    if !auth_path.exists() {
+        return None;
+    }
+
+    for flag in ["-V", "--version"] {
+        let output = match std::process::Command::new(auth_path).arg(flag).output() {
+            Ok(output) => output,
+            Err(_) => continue,
+        };
+        if !output.status.success() {
+            continue;
+        }
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        if let Some(version) = parse_version_from_cli_output(&stdout) {
+            return Some(version);
+        }
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        if let Some(version) = parse_version_from_cli_output(&stderr) {
+            return Some(version);
+        }
+    }
+    None
+}
+
+fn parse_version_from_cli_output(output: &str) -> Option<String> {
+    for token in output.split_whitespace().rev() {
+        if !looks_like_version_token(token) {
+            continue;
+        }
+        let normalized = github_releases::normalize_version_string(token);
+        if !normalized.is_empty() {
+            return Some(normalized);
+        }
+    }
+    None
+}
+
+fn looks_like_version_token(token: &str) -> bool {
+    let trimmed = token.trim_matches(|c: char| c == ',' || c == ';' || c == ')' || c == '(');
+    trimmed.chars().any(|c| c.is_ascii_digit())
+        && trimmed.chars().all(|c| {
+            c.is_ascii_alphanumeric() || c == '.' || c == '-' || c == '+' || c == '_' || c == 'v'
+        })
 }
 
 async fn install_auth_with_config(
@@ -780,6 +899,7 @@ async fn install_wrapper_to_dir(
         no_cache,
         prerelease,
         release_tag,
+        github_releases::wrapper_version_from_asset_url(managed_wrapper_id, wrapper_url).as_deref(),
         linux_libc,
     )
     .await?;
@@ -795,6 +915,7 @@ async fn install_wrapper_runtime(
     no_cache: bool,
     prerelease: bool,
     release_tag: Option<&str>,
+    selected_wrapper_version: Option<&str>,
     linux_libc: Option<LinuxLibcMode>,
 ) -> Result<(), HackArenaError> {
     if managed_wrapper_id.eq_ignore_ascii_case("python") {
@@ -816,6 +937,7 @@ async fn install_wrapper_runtime(
                 managed_wrapper_id,
                 no_cache,
                 prerelease,
+                selected_wrapper_version,
                 linux_libc,
             )
             .await?
@@ -858,6 +980,7 @@ async fn install_wrapper_runtime(
                 managed_wrapper_id,
                 no_cache,
                 prerelease,
+                selected_wrapper_version,
                 linux_libc,
             )
             .await?
@@ -911,6 +1034,7 @@ async fn install_wrapper_runtime(
                 managed_wrapper_id,
                 no_cache,
                 prerelease,
+                selected_wrapper_version,
                 linux_libc,
             )
             .await?
@@ -953,6 +1077,7 @@ async fn install_wrapper_runtime(
                 managed_wrapper_id,
                 no_cache,
                 prerelease,
+                selected_wrapper_version,
                 linux_libc,
             )
             .await?
