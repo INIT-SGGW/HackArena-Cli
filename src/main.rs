@@ -8,6 +8,8 @@ mod constants;
 mod doctor;
 mod download;
 mod error;
+mod github_auth;
+mod github_http;
 mod github_releases;
 mod install;
 mod self_update;
@@ -15,7 +17,7 @@ mod submission_proto;
 mod submit;
 
 use clap::Parser;
-use cli::{Cli, Command, InstallSubcommand, LinuxLibcArg, UpdateSubcommand};
+use cli::{Cli, Command, GithubSubcommand, InstallSubcommand, LinuxLibcArg, UpdateSubcommand};
 use config::Paths;
 use error::HackArenaError;
 use github_releases::LinuxLibcMode;
@@ -168,6 +170,11 @@ impl Command {
                 prerelease,
             } => doctor::status(paths, *no_cache, *prerelease, verbose).await?,
             Command::Auth { args } => auth_cmd::run_auth(paths, args)?,
+            Command::Github { command } => match command {
+                GithubSubcommand::Login => github_auth::login(paths).await?,
+                GithubSubcommand::Logout => github_auth::logout(paths)?,
+                GithubSubcommand::Status => github_auth::status(paths)?,
+            },
             Command::Submit { slot, description } => {
                 submit::submit(paths, *slot, description.as_deref()).await?
             }

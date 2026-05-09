@@ -126,7 +126,16 @@ include = ["user/package.json", "user/src/**/*"]
 exclude = ["user/node_modules/**/*", "user/dist/**/*", "user/build/**/*"]
 ```
 
-## 6. GitHub token (private repos)
+## 6. GitHub authentication
+
+Persistent login:
+
+```bash
+hackarena github login
+hackarena github status
+```
+
+Environment variable:
 
 PowerShell:
 
@@ -139,6 +148,11 @@ bash/zsh:
 ```bash
 export GH_TOKEN=ghp_xxx
 ```
+
+Use a GitHub token if:
+
+- wrapper/backend/auth repos are private
+- many users share one network and anonymous GitHub API rate limits become a problem
 
 If the token does not have repository access, GitHub API often returns `404`.
 

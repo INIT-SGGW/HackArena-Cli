@@ -6,6 +6,7 @@ use crate::config::{
 use crate::constants::PROJECT_WRAPPERS_DIR;
 use crate::download::sha256_file_hex;
 use crate::error::HackArenaError;
+use crate::github_auth;
 use crate::github_releases;
 use crate::install::{discover_installed_wrappers, wrapper_install_layout_issue};
 use owo_colors::OwoColorize;
@@ -54,8 +55,9 @@ pub async fn doctor(
 
     let _config = load_effective_config(paths, &project, no_cache, prerelease).await?;
     println!("Artifact source: GitHub Releases");
+    print_github_auth_status(paths)?;
     if verbose {
-        print_verbose_runtime(no_cache, prerelease);
+        print_verbose_runtime(paths, no_cache, prerelease);
     }
     println!();
 
@@ -293,9 +295,9 @@ pub async fn status(
 
     if verbose {
         println!();
-        print_verbose_runtime(no_cache, prerelease);
+        print_verbose_runtime(paths, no_cache, prerelease);
         println!(
-            "Update check uses GitHub Releases metadata. For private repos, set GH_TOKEN or GITHUB_TOKEN."
+            "Update check uses GitHub Releases metadata. For private repos or higher rate limits, run `hackarena github login` or set GH_TOKEN/GITHUB_TOKEN."
         );
     }
 
@@ -621,7 +623,7 @@ fn print_untracked_wrapper_status(entry: &WrapperDiskEntry) {
     }
 }
 
-fn print_verbose_runtime(no_cache: bool, prerelease: bool) {
+fn print_verbose_runtime(paths: &Paths, no_cache: bool, prerelease: bool) {
     let cache_mode = if no_cache {
         "disabled (`--no-cache`)"
     } else {
@@ -632,28 +634,33 @@ fn print_verbose_runtime(no_cache: bool, prerelease: bool) {
     } else {
         "stable-only"
     };
-    let token = if github_token_present() {
-        "set"
-    } else {
-        "not set"
-    };
+    let token = github_auth::github_token_source(paths)
+        .ok()
+        .flatten()
+        .map(|value| value.as_str())
+        .unwrap_or("none");
     println!("Verbose: cache: {cache_mode}");
     println!("Verbose: release channel: {channel}");
-    println!("Verbose: GH_TOKEN/GITHUB_TOKEN: {token}");
+    println!("Verbose: GitHub token source: {token}");
     if let Ok(Some(linux_libc)) = github_releases::linux_libc_verbose_summary(None) {
         println!("Verbose: linux libc: {linux_libc}");
     }
 }
 
-fn github_token_present() -> bool {
-    for key in ["GH_TOKEN", "GITHUB_TOKEN"] {
-        if let Ok(v) = std::env::var(key)
-            && !v.trim().is_empty()
-        {
-            return true;
+fn print_github_auth_status(paths: &Paths) -> Result<(), HackArenaError> {
+    match github_auth::github_token_source(paths)? {
+        Some(source) => {
+            println!("GitHub auth: {}", source.as_str());
+        }
+        None => {
+            println!("GitHub auth: none");
+            println!(
+                "Note: anonymous GitHub API rate limits may apply. Run `{}` or set GH_TOKEN/GITHUB_TOKEN.",
+                cmd_hint::run_cli("github login")
+            );
         }
     }
-    false
+    Ok(())
 }
 
 fn format_version(version: &str) -> String {

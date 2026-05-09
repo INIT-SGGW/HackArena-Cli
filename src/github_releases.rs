@@ -4,7 +4,8 @@ use crate::config::{
 };
 use crate::constants::{PROJECT_BACKEND_DIR, PROJECT_WRAPPERS_DIR};
 use crate::error::HackArenaError;
-use serde::{Deserialize, Serialize, de::DeserializeOwned};
+use crate::github_http::{self, GITHUB_BINARY_ACCEPT, GITHUB_JSON_ACCEPT, GithubGetOutcome};
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::fs;
@@ -29,7 +30,7 @@ const WRAPPERS_EDITION_3: &[(&str, &str)] = &[
     ("typescript", "INIT-SGGW/HackArena3.0-ApiWrapper-TypeScript"),
 ];
 const CHECKSUMS_ASSET_NAME: &str = "SHA256SUMS.txt";
-const RELEASE_CACHE_TTL: Duration = Duration::from_secs(300);
+const RELEASE_CACHE_TTL: Duration = Duration::from_secs(15 * 60);
 const LINUX_LIBC_ENV: &str = "HACKARENA_LINUX_LIBC";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -88,6 +89,13 @@ struct GithubAsset {
     name: String,
     url: String,
     browser_download_url: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct GithubCacheMeta {
+    #[serde(default)]
+    etag: Option<String>,
+    fetched_at_unix: u64,
 }
 
 #[derive(Debug, Clone)]
@@ -299,10 +307,12 @@ pub async fn self_update_release_by_tag(
         return Ok(None);
     };
     resolve_component_from_release(
+        paths,
         HACKARENA_CLI_REPO,
         &release,
         ComponentSelector::HackArenaCli,
         &target,
+        use_cache,
     )
     .await
     .map(Some)
@@ -350,10 +360,12 @@ pub async fn wrapper_from_release_tag(
         return Ok(None);
     };
     let asset = resolve_component_from_release(
+        paths,
         repo,
         &release,
         ComponentSelector::Wrapper(base_id),
         &target,
+        use_cache,
     )
     .await?;
     Ok(Some(ProjectInstalledBundle {
@@ -382,7 +394,7 @@ pub async fn latest_wrapper_python_wheel_from_releases(
     let Some(release) = latest_release(paths, repo, use_cache, prerelease).await? else {
         return Ok(None);
     };
-    resolve_python_wheel_from_release(repo, base_id, &target, &release)
+    resolve_python_wheel_from_release(paths, repo, base_id, &target, &release, use_cache)
         .await
         .map(Some)
 }
@@ -404,7 +416,7 @@ pub async fn wrapper_python_wheel_from_release_tag(
     let Some(release) = release_by_tag(paths, repo, release_tag, use_cache).await? else {
         return Ok(None);
     };
-    resolve_python_wheel_from_release(repo, base_id, &target, &release)
+    resolve_python_wheel_from_release(paths, repo, base_id, &target, &release, use_cache)
         .await
         .map(Some)
 }
@@ -426,7 +438,7 @@ pub async fn latest_wrapper_csharp_nupkg_from_releases(
     let Some(release) = latest_release(paths, repo, use_cache, prerelease).await? else {
         return Ok(None);
     };
-    resolve_csharp_nupkg_from_release(repo, base_id, &target, &release)
+    resolve_csharp_nupkg_from_release(paths, repo, base_id, &target, &release, use_cache)
         .await
         .map(Some)
 }
@@ -448,7 +460,7 @@ pub async fn wrapper_csharp_nupkg_from_release_tag(
     let Some(release) = release_by_tag(paths, repo, release_tag, use_cache).await? else {
         return Ok(None);
     };
-    resolve_csharp_nupkg_from_release(repo, base_id, &target, &release)
+    resolve_csharp_nupkg_from_release(paths, repo, base_id, &target, &release, use_cache)
         .await
         .map(Some)
 }
@@ -470,7 +482,7 @@ pub async fn latest_wrapper_cpp_sdk_from_releases(
     let Some(release) = latest_release(paths, repo, use_cache, prerelease).await? else {
         return Ok(None);
     };
-    resolve_cpp_sdk_from_release(repo, base_id, &target, &release)
+    resolve_cpp_sdk_from_release(paths, repo, base_id, &target, &release, use_cache)
         .await
         .map(Some)
 }
@@ -492,7 +504,7 @@ pub async fn wrapper_cpp_sdk_from_release_tag(
     let Some(release) = release_by_tag(paths, repo, release_tag, use_cache).await? else {
         return Ok(None);
     };
-    resolve_cpp_sdk_from_release(repo, base_id, &target, &release)
+    resolve_cpp_sdk_from_release(paths, repo, base_id, &target, &release, use_cache)
         .await
         .map(Some)
 }
@@ -514,7 +526,7 @@ pub async fn latest_wrapper_typescript_tgz_from_releases(
     let Some(release) = latest_release(paths, repo, use_cache, prerelease).await? else {
         return Ok(None);
     };
-    resolve_typescript_tgz_from_release(repo, base_id, &target, &release)
+    resolve_typescript_tgz_from_release(paths, repo, base_id, &target, &release, use_cache)
         .await
         .map(Some)
 }
@@ -536,7 +548,7 @@ pub async fn wrapper_typescript_tgz_from_release_tag(
     let Some(release) = release_by_tag(paths, repo, release_tag, use_cache).await? else {
         return Ok(None);
     };
-    resolve_typescript_tgz_from_release(repo, base_id, &target, &release)
+    resolve_typescript_tgz_from_release(paths, repo, base_id, &target, &release, use_cache)
         .await
         .map(Some)
 }
@@ -596,18 +608,20 @@ async fn resolve_optional_component(
     let Some(release) = latest_release(paths, repo, use_cache, allow_prerelease).await? else {
         return Ok(None);
     };
-    resolve_component_from_release(repo, &release, component, target)
+    resolve_component_from_release(paths, repo, &release, component, target, use_cache)
         .await
         .map(Some)
 }
 
 async fn resolve_component_from_release(
+    paths: &Paths,
     repo: &str,
     release: &GithubRelease,
     component: ComponentSelector<'_>,
     target: &TargetTripleResolution,
+    use_cache: bool,
 ) -> Result<ResolvedReleaseAsset, HackArenaError> {
-    let checksums = fetch_release_checksums(repo, release).await?;
+    let checksums = fetch_release_checksums(paths, repo, release, use_cache).await?;
     resolve_component_from_release_with_checksums(repo, release, component, target, &checksums)
 }
 
@@ -634,12 +648,14 @@ fn resolve_component_from_release_with_checksums(
 }
 
 async fn resolve_python_wheel_from_release(
+    paths: &Paths,
     repo: &str,
     wrapper_id: &str,
     target: &TargetTripleResolution,
     release: &GithubRelease,
+    use_cache: bool,
 ) -> Result<ArtifactSpec, HackArenaError> {
-    let checksums = fetch_release_checksums(repo, release).await?;
+    let checksums = fetch_release_checksums(paths, repo, release, use_cache).await?;
 
     let wrapper_asset = select_component_asset(
         &release.assets,
@@ -678,12 +694,14 @@ async fn resolve_python_wheel_from_release(
 }
 
 async fn resolve_csharp_nupkg_from_release(
+    paths: &Paths,
     repo: &str,
     wrapper_id: &str,
     target: &TargetTripleResolution,
     release: &GithubRelease,
+    use_cache: bool,
 ) -> Result<ArtifactSpec, HackArenaError> {
-    let checksums = fetch_release_checksums(repo, release).await?;
+    let checksums = fetch_release_checksums(paths, repo, release, use_cache).await?;
 
     let wrapper_asset = select_component_asset(
         &release.assets,
@@ -722,12 +740,14 @@ async fn resolve_csharp_nupkg_from_release(
 }
 
 async fn resolve_cpp_sdk_from_release(
+    paths: &Paths,
     repo: &str,
     wrapper_id: &str,
     target: &TargetTripleResolution,
     release: &GithubRelease,
+    use_cache: bool,
 ) -> Result<ArtifactSpec, HackArenaError> {
-    let checksums = fetch_release_checksums(repo, release).await?;
+    let checksums = fetch_release_checksums(paths, repo, release, use_cache).await?;
 
     let wrapper_asset = select_component_asset(
         &release.assets,
@@ -745,12 +765,14 @@ async fn resolve_cpp_sdk_from_release(
 }
 
 async fn resolve_typescript_tgz_from_release(
+    paths: &Paths,
     repo: &str,
     wrapper_id: &str,
     target: &TargetTripleResolution,
     release: &GithubRelease,
+    use_cache: bool,
 ) -> Result<ArtifactSpec, HackArenaError> {
-    let checksums = fetch_release_checksums(repo, release).await?;
+    let checksums = fetch_release_checksums(paths, repo, release, use_cache).await?;
 
     let wrapper_asset = select_component_asset(
         &release.assets,
@@ -907,8 +929,10 @@ fn linux_arch_from_triple(triple: &str) -> Option<&str> {
 }
 
 async fn fetch_release_checksums(
+    paths: &Paths,
     repo: &str,
     release: &GithubRelease,
+    use_cache: bool,
 ) -> Result<HashMap<String, String>, HackArenaError> {
     let checksums_asset = release
         .assets
@@ -920,7 +944,27 @@ async fn fetch_release_checksums(
                 release.tag_name
             ))
         })?;
-    let checksums_content = fetch_text_with_github_auth(&checksums_asset.url).await?;
+
+    let cache_dir = cache_dir_for_repo_tag(paths, repo, &release.tag_name);
+    let data_path = cache_dir.join("checksums.txt");
+    let meta_path = cache_dir.join("checksums.meta.json");
+    let checksums_content = fetch_cached_text_resource(
+        paths,
+        &checksums_asset.url,
+        GITHUB_BINARY_ACCEPT,
+        use_cache,
+        &data_path,
+        &meta_path,
+        false,
+    )
+    .await?
+    .ok_or_else(|| {
+        HackArenaError::msg(format!(
+            "Release `{}` in `{repo}` is missing `{CHECKSUMS_ASSET_NAME}`.",
+            release.tag_name
+        ))
+    })?;
+
     parse_sha256_sums(&checksums_content)
 }
 
@@ -930,30 +974,8 @@ async fn latest_release(
     use_cache: bool,
     allow_prerelease: bool,
 ) -> Result<Option<GithubRelease>, HackArenaError> {
-    let cache_path = cache_path_for_repo(paths, repo, allow_prerelease);
-    if use_cache && cache_path.exists() && cache_is_fresh(&cache_path, RELEASE_CACHE_TTL)? {
-        let bytes =
-            std::fs::read(&cache_path).map_err(|e| HackArenaError::io_with_path(&cache_path, e))?;
-        let release = serde_json::from_slice(&bytes)
-            .map_err(|e| HackArenaError::json_with_path(&cache_path, e))?;
-        return Ok(Some(release));
-    }
-
-    let url = format!("https://api.github.com/repos/{repo}/releases?per_page=20");
-    let releases: Vec<GithubRelease> = fetch_json_with_github_auth(&url).await?;
-    let selected = select_latest_release(&releases, allow_prerelease);
-
-    if let Some(release) = selected.clone() {
-        if let Some(parent) = cache_path.parent() {
-            ensure_dir(parent)?;
-        }
-        let data = serde_json::to_vec_pretty(&release)
-            .map_err(|e| HackArenaError::json_with_path(&cache_path, e))?;
-        std::fs::write(&cache_path, data)
-            .map_err(|e| HackArenaError::io_with_path(&cache_path, e))?;
-    }
-
-    Ok(selected)
+    let releases = fetch_release_list(paths, repo, use_cache).await?;
+    Ok(select_latest_release(&releases, allow_prerelease))
 }
 
 async fn latest_self_update_repo_release(
@@ -961,30 +983,11 @@ async fn latest_self_update_repo_release(
     use_cache: bool,
     allow_prerelease: bool,
 ) -> Result<Option<GithubRelease>, HackArenaError> {
-    let cache_path = cache_path_for_self_update_repo(paths, allow_prerelease);
-    if use_cache && cache_path.exists() && cache_is_fresh(&cache_path, RELEASE_CACHE_TTL)? {
-        let bytes =
-            std::fs::read(&cache_path).map_err(|e| HackArenaError::io_with_path(&cache_path, e))?;
-        let release = serde_json::from_slice(&bytes)
-            .map_err(|e| HackArenaError::json_with_path(&cache_path, e))?;
-        return Ok(Some(release));
-    }
-
-    let url = format!("https://api.github.com/repos/{HACKARENA_CLI_REPO}/releases?per_page=20");
-    let releases: Vec<GithubRelease> = fetch_json_with_github_auth(&url).await?;
-    let selected = select_latest_self_update_release(&releases, allow_prerelease);
-
-    if let Some(release) = selected.clone() {
-        if let Some(parent) = cache_path.parent() {
-            ensure_dir(parent)?;
-        }
-        let data = serde_json::to_vec_pretty(&release)
-            .map_err(|e| HackArenaError::json_with_path(&cache_path, e))?;
-        std::fs::write(&cache_path, data)
-            .map_err(|e| HackArenaError::io_with_path(&cache_path, e))?;
-    }
-
-    Ok(selected)
+    let releases = fetch_release_list(paths, HACKARENA_CLI_REPO, use_cache).await?;
+    Ok(select_latest_self_update_release(
+        &releases,
+        allow_prerelease,
+    ))
 }
 
 async fn release_by_tag(
@@ -993,41 +996,312 @@ async fn release_by_tag(
     release_tag: &str,
     use_cache: bool,
 ) -> Result<Option<GithubRelease>, HackArenaError> {
-    let cache_path = cache_path_for_repo_tag(paths, repo, release_tag);
-    if use_cache && cache_path.exists() && cache_is_fresh(&cache_path, RELEASE_CACHE_TTL)? {
-        let bytes =
-            std::fs::read(&cache_path).map_err(|e| HackArenaError::io_with_path(&cache_path, e))?;
-        let release = serde_json::from_slice(&bytes)
-            .map_err(|e| HackArenaError::json_with_path(&cache_path, e))?;
-        return Ok(Some(release));
-    }
-
-    let Some(release) = fetch_release_by_tag(repo, release_tag).await? else {
-        return Ok(None);
-    };
-
-    if let Some(parent) = cache_path.parent() {
-        ensure_dir(parent)?;
-    }
-    let data = serde_json::to_vec_pretty(&release)
-        .map_err(|e| HackArenaError::json_with_path(&cache_path, e))?;
-    std::fs::write(&cache_path, data).map_err(|e| HackArenaError::io_with_path(&cache_path, e))?;
-
-    Ok(Some(release))
+    let cache_dir = cache_dir_for_repo_tag(paths, repo, release_tag);
+    let data_path = cache_dir.join("release_by_tag.json");
+    let meta_path = cache_dir.join("release_by_tag.meta.json");
+    let url = format!("https://api.github.com/repos/{repo}/releases/tags/{release_tag}");
+    fetch_cached_json_resource(paths, &url, use_cache, &data_path, &meta_path, true).await
 }
 
-fn cache_is_fresh(path: &Path, max_age: Duration) -> Result<bool, HackArenaError> {
-    let meta = std::fs::metadata(path).map_err(|e| HackArenaError::io_with_path(path, e))?;
-    let modified = match meta.modified() {
-        Ok(ts) => ts,
-        Err(_) => return Ok(false),
+async fn fetch_release_list(
+    paths: &Paths,
+    repo: &str,
+    use_cache: bool,
+) -> Result<Vec<GithubRelease>, HackArenaError> {
+    let cache_dir = cache_dir_for_repo(paths, repo);
+    let data_path = cache_dir.join("release_list.json");
+    let meta_path = cache_dir.join("release_list.meta.json");
+    let url = format!("https://api.github.com/repos/{repo}/releases?per_page=20");
+    Ok(
+        fetch_cached_json_resource(paths, &url, use_cache, &data_path, &meta_path, false)
+            .await?
+            .unwrap_or_default(),
+    )
+}
+
+async fn fetch_cached_json_resource<T: for<'de> Deserialize<'de> + Clone>(
+    paths: &Paths,
+    url: &str,
+    use_cache: bool,
+    data_path: &Path,
+    meta_path: &Path,
+    allow_not_found: bool,
+) -> Result<Option<T>, HackArenaError> {
+    let cached = if use_cache {
+        read_cached_json::<T>(data_path, meta_path)?
+    } else {
+        None
     };
-    let now = SystemTime::now();
-    let age = match now.duration_since(modified) {
-        Ok(age) => age,
-        Err(_) => return Ok(false),
+    if let Some((value, meta)) = &cached
+        && cache_meta_is_fresh(meta, RELEASE_CACHE_TTL)
+    {
+        return Ok(Some(value.clone()));
+    }
+
+    let client = reqwest::Client::new();
+    let mut last_rate_limit_status: Option<u16> = None;
+    let max_attempts = 3;
+
+    for attempt in 0..max_attempts {
+        let if_none_match = cached.as_ref().and_then(|(_, meta)| meta.etag.as_deref());
+        match github_http::get(
+            paths,
+            &client,
+            url,
+            GITHUB_JSON_ACCEPT,
+            if_none_match,
+            allow_not_found,
+        )
+        .await
+        {
+            Ok(GithubGetOutcome::Response(resp)) => {
+                let etag = github_http::response_etag(resp.headers());
+                let bytes = resp
+                    .bytes()
+                    .await
+                    .map_err(|e| HackArenaError::http_with_url(url, e))?;
+                let parsed = serde_json::from_slice::<T>(&bytes)
+                    .map_err(|e| HackArenaError::json_with_url(url, e))?;
+                write_cached_bytes(
+                    data_path,
+                    meta_path,
+                    &bytes,
+                    GithubCacheMeta {
+                        etag,
+                        fetched_at_unix: now_unix_secs()?,
+                    },
+                )?;
+                return Ok(Some(parsed));
+            }
+            Ok(GithubGetOutcome::NotModified) => {
+                if let Some((value, mut meta)) = cached.clone() {
+                    meta.fetched_at_unix = now_unix_secs()?;
+                    write_cache_meta(meta_path, &meta)?;
+                    return Ok(Some(value));
+                }
+                return Err(HackArenaError::msg(format!(
+                    "GitHub returned 304 for `{url}` but no cached metadata was available."
+                )));
+            }
+            Ok(GithubGetOutcome::NotFound) => return Ok(None),
+            Ok(GithubGetOutcome::RateLimited(info)) => {
+                last_rate_limit_status = Some(info.status_code);
+                if attempt + 1 < max_attempts {
+                    tokio::time::sleep(backoff_delay_for_attempt(&info, attempt)).await;
+                    continue;
+                }
+                return Err(github_http::rate_limit_error(
+                    url,
+                    last_rate_limit_status.unwrap_or(403),
+                ));
+            }
+            Err(err) => return Err(err),
+        }
+    }
+
+    Err(github_http::rate_limit_error(
+        url,
+        last_rate_limit_status.unwrap_or(403),
+    ))
+}
+
+async fn fetch_cached_text_resource(
+    paths: &Paths,
+    url: &str,
+    accept: &str,
+    use_cache: bool,
+    data_path: &Path,
+    meta_path: &Path,
+    allow_not_found: bool,
+) -> Result<Option<String>, HackArenaError> {
+    let cached = if use_cache {
+        read_cached_text(data_path, meta_path)?
+    } else {
+        None
     };
-    Ok(age <= max_age)
+    if let Some((value, meta)) = &cached
+        && cache_meta_is_fresh(meta, RELEASE_CACHE_TTL)
+    {
+        return Ok(Some(value.clone()));
+    }
+
+    let client = reqwest::Client::new();
+    let mut last_rate_limit_status: Option<u16> = None;
+    let max_attempts = 3;
+
+    for attempt in 0..max_attempts {
+        let if_none_match = cached.as_ref().and_then(|(_, meta)| meta.etag.as_deref());
+        match github_http::get(paths, &client, url, accept, if_none_match, allow_not_found).await {
+            Ok(GithubGetOutcome::Response(resp)) => {
+                let etag = github_http::response_etag(resp.headers());
+                let text = resp
+                    .text()
+                    .await
+                    .map_err(|e| HackArenaError::http_with_url(url, e))?;
+                write_cached_text(
+                    data_path,
+                    meta_path,
+                    &text,
+                    GithubCacheMeta {
+                        etag,
+                        fetched_at_unix: now_unix_secs()?,
+                    },
+                )?;
+                return Ok(Some(text));
+            }
+            Ok(GithubGetOutcome::NotModified) => {
+                if let Some((value, mut meta)) = cached.clone() {
+                    meta.fetched_at_unix = now_unix_secs()?;
+                    write_cache_meta(meta_path, &meta)?;
+                    return Ok(Some(value));
+                }
+                return Err(HackArenaError::msg(format!(
+                    "GitHub returned 304 for `{url}` but no cached text was available."
+                )));
+            }
+            Ok(GithubGetOutcome::NotFound) => return Ok(None),
+            Ok(GithubGetOutcome::RateLimited(info)) => {
+                last_rate_limit_status = Some(info.status_code);
+                if attempt + 1 < max_attempts {
+                    tokio::time::sleep(backoff_delay_for_attempt(&info, attempt)).await;
+                    continue;
+                }
+                return Err(github_http::rate_limit_error(
+                    url,
+                    last_rate_limit_status.unwrap_or(403),
+                ));
+            }
+            Err(err) => return Err(err),
+        }
+    }
+
+    Err(github_http::rate_limit_error(
+        url,
+        last_rate_limit_status.unwrap_or(403),
+    ))
+}
+
+fn read_cached_json<T: for<'de> Deserialize<'de> + Clone>(
+    data_path: &Path,
+    meta_path: &Path,
+) -> Result<Option<(T, GithubCacheMeta)>, HackArenaError> {
+    let Some((bytes, meta)) = read_cached_bytes(data_path, meta_path)? else {
+        return Ok(None);
+    };
+    let parsed = match serde_json::from_slice::<T>(&bytes) {
+        Ok(value) => value,
+        Err(_) => return Ok(None),
+    };
+    Ok(Some((parsed, meta)))
+}
+
+fn read_cached_text(
+    data_path: &Path,
+    meta_path: &Path,
+) -> Result<Option<(String, GithubCacheMeta)>, HackArenaError> {
+    let Some((bytes, meta)) = read_cached_bytes(data_path, meta_path)? else {
+        return Ok(None);
+    };
+    let parsed = match String::from_utf8(bytes) {
+        Ok(value) => value,
+        Err(_) => return Ok(None),
+    };
+    Ok(Some((parsed, meta)))
+}
+
+fn read_cached_bytes(
+    data_path: &Path,
+    meta_path: &Path,
+) -> Result<Option<(Vec<u8>, GithubCacheMeta)>, HackArenaError> {
+    if !data_path.exists() || !meta_path.exists() {
+        return Ok(None);
+    }
+    let meta_bytes = fs::read(meta_path).map_err(|e| HackArenaError::io_with_path(meta_path, e))?;
+    let meta: GithubCacheMeta = match serde_json::from_slice(&meta_bytes) {
+        Ok(meta) => meta,
+        Err(_) => return Ok(None),
+    };
+    let data = fs::read(data_path).map_err(|e| HackArenaError::io_with_path(data_path, e))?;
+    Ok(Some((data, meta)))
+}
+
+fn write_cached_text(
+    data_path: &Path,
+    meta_path: &Path,
+    content: &str,
+    meta: GithubCacheMeta,
+) -> Result<(), HackArenaError> {
+    write_cached_bytes(data_path, meta_path, content.as_bytes(), meta)
+}
+
+fn write_cached_bytes(
+    data_path: &Path,
+    meta_path: &Path,
+    bytes: &[u8],
+    meta: GithubCacheMeta,
+) -> Result<(), HackArenaError> {
+    if let Some(parent) = data_path.parent() {
+        ensure_dir(parent)?;
+    }
+    if let Some(parent) = meta_path.parent() {
+        ensure_dir(parent)?;
+    }
+    fs::write(data_path, bytes).map_err(|e| HackArenaError::io_with_path(data_path, e))?;
+    write_cache_meta(meta_path, &meta)?;
+    Ok(())
+}
+
+fn write_cache_meta(meta_path: &Path, meta: &GithubCacheMeta) -> Result<(), HackArenaError> {
+    let data = serde_json::to_vec_pretty(meta)
+        .map_err(|e| HackArenaError::json_with_path(meta_path, e))?;
+    fs::write(meta_path, data).map_err(|e| HackArenaError::io_with_path(meta_path, e))?;
+    Ok(())
+}
+
+fn cache_meta_is_fresh(meta: &GithubCacheMeta, ttl: Duration) -> bool {
+    cache_meta_age(meta).is_some_and(|age| age <= ttl)
+}
+
+fn cache_meta_age(meta: &GithubCacheMeta) -> Option<Duration> {
+    let fetched_at =
+        SystemTime::UNIX_EPOCH.checked_add(Duration::from_secs(meta.fetched_at_unix))?;
+    SystemTime::now().duration_since(fetched_at).ok()
+}
+
+fn cache_dir_for_repo(paths: &Paths, repo: &str) -> PathBuf {
+    let mut hasher = Sha256::new();
+    hasher.update(repo.as_bytes());
+    let key = hex::encode(hasher.finalize());
+    paths.releases_cache_dir().join(key)
+}
+
+fn cache_dir_for_repo_tag(paths: &Paths, repo: &str, release_tag: &str) -> PathBuf {
+    let mut hasher = Sha256::new();
+    hasher.update(repo.as_bytes());
+    hasher.update(b":");
+    hasher.update(release_tag.as_bytes());
+    let key = hex::encode(hasher.finalize());
+    paths.releases_cache_dir().join(key)
+}
+
+fn backoff_delay_for_attempt(info: &github_http::GithubRateLimitInfo, attempt: usize) -> Duration {
+    if let Some(retry_after) = info.retry_after {
+        return retry_after.min(Duration::from_secs(5));
+    }
+    if let Some(reset_after) = info.reset_after {
+        return reset_after.min(Duration::from_secs(5));
+    }
+    match attempt {
+        0 => Duration::from_secs(1),
+        _ => Duration::from_secs(2),
+    }
+}
+
+fn now_unix_secs() -> Result<u64, HackArenaError> {
+    SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .map(|value| value.as_secs())
+        .map_err(|err| HackArenaError::msg(format!("System clock error: {err}")))
 }
 
 fn select_latest_release(
@@ -1051,50 +1325,6 @@ fn select_latest_self_update_release(
         return releases.iter().find(|r| !r.draft).cloned();
     }
     select_latest_release(releases, false)
-}
-
-fn cache_path_for_repo(paths: &Paths, repo: &str, allow_prerelease: bool) -> PathBuf {
-    let mut hasher = Sha256::new();
-    hasher.update(repo.as_bytes());
-    let mode_marker: &[u8] = if allow_prerelease {
-        b":allow_prerelease"
-    } else {
-        b":stable_only"
-    };
-    hasher.update(mode_marker);
-    let key = hex::encode(hasher.finalize());
-    paths
-        .releases_cache_dir()
-        .join(key)
-        .join("latest_release.json")
-}
-
-fn cache_path_for_self_update_repo(paths: &Paths, allow_prerelease: bool) -> PathBuf {
-    let mut hasher = Sha256::new();
-    hasher.update(HACKARENA_CLI_REPO.as_bytes());
-    let mode_marker: &[u8] = if allow_prerelease {
-        b":self_update_allow_prerelease"
-    } else {
-        b":self_update_stable_only"
-    };
-    hasher.update(mode_marker);
-    let key = hex::encode(hasher.finalize());
-    paths
-        .releases_cache_dir()
-        .join(key)
-        .join("latest_self_update_release.json")
-}
-
-fn cache_path_for_repo_tag(paths: &Paths, repo: &str, release_tag: &str) -> PathBuf {
-    let mut hasher = Sha256::new();
-    hasher.update(repo.as_bytes());
-    hasher.update(b":");
-    hasher.update(release_tag.as_bytes());
-    let key = hex::encode(hasher.finalize());
-    paths
-        .releases_cache_dir()
-        .join(key)
-        .join("release_by_tag.json")
 }
 
 fn select_component_asset<'a>(
@@ -1758,162 +1988,9 @@ fn default_bin_name_auth() -> String {
     }
 }
 
-async fn fetch_json_with_github_auth<T: DeserializeOwned>(url: &str) -> Result<T, HackArenaError> {
-    let client = reqwest::Client::new();
-    let token = github_token();
-    let resp = get_with_token_fallback(&client, url, token.as_deref()).await?;
-    let bytes = resp
-        .bytes()
-        .await
-        .map_err(|e| HackArenaError::http_with_url(url, e))?;
-    serde_json::from_slice(&bytes).map_err(|e| HackArenaError::json_with_url(url, e))
-}
-
-async fn fetch_text_with_github_auth(url: &str) -> Result<String, HackArenaError> {
-    let client = reqwest::Client::new();
-    let token = github_token();
-    let resp = get_with_token_fallback(&client, url, token.as_deref()).await?;
-    resp.text()
-        .await
-        .map_err(|e| HackArenaError::http_with_url(url, e))
-}
-
-async fn fetch_release_by_tag(
-    repo: &str,
-    release_tag: &str,
-) -> Result<Option<GithubRelease>, HackArenaError> {
-    let client = reqwest::Client::new();
-    let token = github_token();
-    let url = format!("https://api.github.com/repos/{repo}/releases/tags/{release_tag}");
-
-    let resp = get_with_token_fallback_allow_404(&client, &url, token.as_deref()).await?;
-    let Some(resp) = resp else {
-        return Ok(None);
-    };
-    let bytes = resp
-        .bytes()
-        .await
-        .map_err(|e| HackArenaError::http_with_url(&url, e))?;
-    let parsed =
-        serde_json::from_slice(&bytes).map_err(|e| HackArenaError::json_with_url(&url, e))?;
-    Ok(Some(parsed))
-}
-
-fn github_token() -> Option<String> {
-    for key in ["GH_TOKEN", "GITHUB_TOKEN"] {
-        if let Ok(value) = std::env::var(key) {
-            let trimmed = value.trim();
-            if !trimmed.is_empty() {
-                return Some(trimmed.to_string());
-            }
-        }
-    }
-    None
-}
-
-async fn get_with_token_fallback(
-    client: &reqwest::Client,
-    url: &str,
-    token: Option<&str>,
-) -> Result<reqwest::Response, HackArenaError> {
-    let token_present = token.is_some();
-    let resp = send_get(client, url, token).await?;
-    if matches!(
-        resp.status(),
-        reqwest::StatusCode::UNAUTHORIZED | reqwest::StatusCode::FORBIDDEN
-    ) && token_present
-    {
-        let anon = send_get(client, url, None).await?;
-        if anon.status().is_success() {
-            return Ok(anon);
-        }
-        return Err(github_http_status_error(url, anon.status(), false));
-    }
-
-    if resp.status().is_success() {
-        return Ok(resp);
-    }
-    Err(github_http_status_error(url, resp.status(), token_present))
-}
-
-async fn get_with_token_fallback_allow_404(
-    client: &reqwest::Client,
-    url: &str,
-    token: Option<&str>,
-) -> Result<Option<reqwest::Response>, HackArenaError> {
-    let token_present = token.is_some();
-    let resp = send_get(client, url, token).await?;
-    if matches!(
-        resp.status(),
-        reqwest::StatusCode::UNAUTHORIZED | reqwest::StatusCode::FORBIDDEN
-    ) && token_present
-    {
-        let anon = send_get(client, url, None).await?;
-        if anon.status() == reqwest::StatusCode::NOT_FOUND {
-            return Ok(None);
-        }
-        if anon.status().is_success() {
-            return Ok(Some(anon));
-        }
-        return Err(github_http_status_error(url, anon.status(), false));
-    }
-
-    if resp.status() == reqwest::StatusCode::NOT_FOUND {
-        return Ok(None);
-    }
-    if resp.status().is_success() {
-        return Ok(Some(resp));
-    }
-    Err(github_http_status_error(url, resp.status(), token_present))
-}
-
-async fn send_get(
-    client: &reqwest::Client,
-    url: &str,
-    token: Option<&str>,
-) -> Result<reqwest::Response, HackArenaError> {
-    let accept = if is_release_asset_api_url(url) {
-        "application/octet-stream"
-    } else {
-        "application/vnd.github+json"
-    };
-    let mut req = client
-        .get(url)
-        .header(reqwest::header::USER_AGENT, "hackarena-cli")
-        .header(reqwest::header::ACCEPT, accept);
-    if let Some(token) = token {
-        req = req.bearer_auth(token);
-    }
-    req.send()
-        .await
-        .map_err(|e| HackArenaError::http_with_url(url, e))
-}
-
-fn is_release_asset_api_url(url: &str) -> bool {
-    url.contains("api.github.com/repos/") && url.contains("/releases/assets/")
-}
-
 fn with_asset_name_hint(url: &str, asset_name: &str) -> String {
     let sep = if url.contains('?') { '&' } else { '?' };
     format!("{url}{sep}asset_name={asset_name}")
-}
-
-fn github_http_status_error(
-    url: &str,
-    status: reqwest::StatusCode,
-    token_present: bool,
-) -> HackArenaError {
-    if status == reqwest::StatusCode::NOT_FOUND && url.contains("api.github.com/repos/") {
-        if token_present {
-            return HackArenaError::msg(format!(
-                "GitHub API returned 404 for `{url}`. The repository may be private and GH_TOKEN/GITHUB_TOKEN does not have access, or the owner/repo is incorrect."
-            ));
-        }
-        return HackArenaError::msg(format!(
-            "GitHub API returned 404 for `{url}`. For private repositories this is expected without authentication. Set GH_TOKEN (or GITHUB_TOKEN) with repo read access."
-        ));
-    }
-    HackArenaError::msg(format!("HTTP {} for `{url}`", status.as_u16()))
 }
 
 #[cfg(test)]

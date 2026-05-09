@@ -1,5 +1,6 @@
 use crate::config::{Paths, ensure_dir};
 use crate::error::HackArenaError;
+use crate::github_http::{self, GITHUB_BINARY_ACCEPT, GithubGetOutcome};
 use futures_util::StreamExt;
 use sha2::{Digest, Sha256};
 use std::io::Read;
@@ -16,6 +17,7 @@ pub async fn download_to_cache(
     expected_sha256_hex: &str,
 ) -> Result<PathBuf, HackArenaError> {
     download_to_dir(
+        paths,
         &paths.downloads_cache_dir(),
         url,
         cache_filename,
@@ -28,6 +30,7 @@ pub async fn download_to_cache(
 ///
 /// Reuses an existing file when its SHA-256 matches `expected_sha256_hex`.
 pub async fn download_to_dir(
+    paths: &Paths,
     target_dir: &Path,
     url: &str,
     cache_filename: &str,
@@ -55,7 +58,25 @@ pub async fn download_to_dir(
             let _ = tokio::fs::remove_file(&tmp_path).await;
         }
 
-        let resp = get_with_token_fallback(&client, url).await?;
+        let resp =
+            match github_http::get(paths, &client, url, accept_for_url(url), None, false).await? {
+                GithubGetOutcome::Response(resp) => resp,
+                GithubGetOutcome::RateLimited(info) => {
+                    return Err(github_http::rate_limit_error(url, info.status_code));
+                }
+                GithubGetOutcome::NotModified => {
+                    return Err(HackArenaError::msg(format!(
+                        "GitHub unexpectedly returned 304 for `{url}` without an ETag request."
+                    )));
+                }
+                GithubGetOutcome::NotFound => {
+                    return Err(github_http::github_http_status_error(
+                        url,
+                        reqwest::StatusCode::NOT_FOUND,
+                        false,
+                    ));
+                }
+            };
         let final_url = resp.url().to_string();
         let content_type = resp
             .headers()
@@ -144,82 +165,14 @@ fn eq_hex_sha256(expected: &str, actual: &str) -> bool {
     expected.trim().eq_ignore_ascii_case(actual.trim())
 }
 
-async fn get_with_token_fallback(
-    client: &reqwest::Client,
-    url: &str,
-) -> Result<reqwest::Response, HackArenaError> {
-    let token = github_token();
-    let token_present = token.is_some();
-    let resp = send_get(client, url, token.as_deref()).await?;
-    if matches!(
-        resp.status(),
-        reqwest::StatusCode::UNAUTHORIZED | reqwest::StatusCode::FORBIDDEN
-    ) && token_present
-    {
-        let anon = send_get(client, url, None).await?;
-        if anon.status().is_success() {
-            return Ok(anon);
-        }
-        return Err(github_http_status_error(url, anon.status(), false));
-    }
-
-    if resp.status().is_success() {
-        return Ok(resp);
-    }
-    Err(github_http_status_error(url, resp.status(), token_present))
-}
-
-async fn send_get(
-    client: &reqwest::Client,
-    url: &str,
-    token: Option<&str>,
-) -> Result<reqwest::Response, HackArenaError> {
-    let mut req = client
-        .get(url)
-        .header(reqwest::header::USER_AGENT, "hackarena-cli");
+fn accept_for_url(url: &str) -> &'static str {
     if is_release_asset_api_url(url) {
-        req = req.header(reqwest::header::ACCEPT, "application/octet-stream");
+        GITHUB_BINARY_ACCEPT
+    } else {
+        github_http::GITHUB_JSON_ACCEPT
     }
-    if let Some(token) = token {
-        req = req.bearer_auth(token);
-    }
-    req.send()
-        .await
-        .map_err(|e| HackArenaError::http_with_url(url, e))
 }
 
 fn is_release_asset_api_url(url: &str) -> bool {
     url.contains("api.github.com/repos/") && url.contains("/releases/assets/")
-}
-
-fn github_token() -> Option<String> {
-    for key in ["GH_TOKEN", "GITHUB_TOKEN"] {
-        if let Ok(value) = std::env::var(key) {
-            let trimmed = value.trim();
-            if !trimmed.is_empty() {
-                return Some(trimmed.to_string());
-            }
-        }
-    }
-    None
-}
-
-fn github_http_status_error(
-    url: &str,
-    status: reqwest::StatusCode,
-    token_present: bool,
-) -> HackArenaError {
-    if status == reqwest::StatusCode::NOT_FOUND
-        && (url.contains("github.com/") || url.contains("githubusercontent.com/"))
-    {
-        if token_present {
-            return HackArenaError::msg(format!(
-                "GitHub returned 404 for `{url}`. The release asset may not exist or GH_TOKEN/GITHUB_TOKEN lacks access."
-            ));
-        }
-        return HackArenaError::msg(format!(
-            "GitHub returned 404 for `{url}`. For private repositories this is expected without authentication. Set GH_TOKEN (or GITHUB_TOKEN) with repo read access."
-        ));
-    }
-    HackArenaError::msg(format!("HTTP {} for `{url}`", status.as_u16()))
 }

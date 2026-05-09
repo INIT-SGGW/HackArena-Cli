@@ -90,6 +90,7 @@ pub async fn self_update(
 
     println!("Downloading hackarena CLI...");
     let cli_asset_path = download_to_dir(
+        paths,
         &paths.self_update_staging_dir(),
         &release.url,
         &release.name,

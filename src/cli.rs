@@ -101,6 +101,12 @@ pub enum Command {
         args: Vec<String>,
     },
 
+    /// Manage GitHub authentication used for release downloads.
+    Github {
+        #[command(subcommand)]
+        command: GithubSubcommand,
+    },
+
     /// Submit wrapper solution for remote build.
     Submit {
         /// Target submission slot (required for edition `3`).
@@ -149,6 +155,18 @@ pub enum Command {
         #[arg(long)]
         save: bool,
     },
+}
+
+#[derive(Subcommand, Debug)]
+pub enum GithubSubcommand {
+    /// Store a GitHub token in the global HackArena config.
+    Login,
+
+    /// Remove the stored GitHub token from the global HackArena config.
+    Logout,
+
+    /// Show which GitHub token source is active (`env`, `stored`, `none`).
+    Status,
 }
 
 #[derive(Subcommand, Debug)]
