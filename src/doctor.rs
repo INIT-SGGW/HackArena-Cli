@@ -3,12 +3,14 @@ use crate::config::{
     Paths, is_project_dir, load_project_config, load_project_manifest, project_config_path,
     project_manifest_path, validate_edition,
 };
-use crate::constants::PROJECT_WRAPPERS_DIR;
+use crate::constants::{PROJECT_STANDALONE_DIR, PROJECT_WRAPPERS_DIR};
 use crate::download::sha256_file_hex;
 use crate::error::HackArenaError;
 use crate::github_auth;
 use crate::github_releases;
-use crate::install::{discover_installed_wrappers, wrapper_install_layout_issue};
+use crate::install::{
+    discover_installed_wrappers, standalone_install_layout_issue, wrapper_install_layout_issue,
+};
 use owo_colors::OwoColorize;
 use std::collections::BTreeSet;
 use std::io::IsTerminal;
@@ -48,6 +50,7 @@ pub async fn doctor(
         "ha-auth"
     });
     let backend_dir = cwd.join(&project.backend_dir);
+    let standalone_dir = cwd.join(PROJECT_STANDALONE_DIR);
     let manifest = load_project_manifest(&cwd).unwrap_or_default();
     let wrapper_disk_entries = discover_wrapper_disk_entries(&cwd, &project.edition, &manifest);
 
@@ -94,6 +97,7 @@ pub async fn doctor(
         &backend_dir,
         Some(cmd_hint::run_cli("install backend")),
     );
+    print_standalone_doctor_status(&manifest, &standalone_dir);
     print_check_with_action(
         "wrappers/",
         cwd.join("wrappers").exists(),
@@ -207,6 +211,50 @@ fn print_check_with_action(label: &str, ok: bool, path: &Path, action: Option<St
     print_check(label, ok, path);
     if !ok && let Some(action) = action {
         print_action(&format!("run `{action}`"));
+    }
+}
+
+fn print_standalone_doctor_status(
+    manifest: &crate::config::ProjectManifest,
+    standalone_dir: &Path,
+) {
+    let tracked = manifest
+        .standalone
+        .as_ref()
+        .is_some_and(|bundle| bundle.install_dir == PathBuf::from(PROJECT_STANDALONE_DIR));
+
+    if !standalone_dir.exists() {
+        print_warn("standalone", "not installed", standalone_dir);
+        print_action(&format!(
+            "run `{}`",
+            cmd_hint::run_cli("install standalone")
+        ));
+        return;
+    }
+
+    if let Some(issue) = standalone_install_layout_issue(standalone_dir) {
+        print_warn(
+            "standalone",
+            &format!("invalid layout: {issue}"),
+            standalone_dir,
+        );
+        let command = if tracked {
+            "update standalone"
+        } else {
+            "install standalone"
+        };
+        print_action(&format!("run `{}`", cmd_hint::run_cli(command)));
+        return;
+    }
+
+    if tracked {
+        print_check("standalone", true, standalone_dir);
+    } else {
+        print_warn(
+            "standalone",
+            "installed on disk, not tracked in manifest",
+            standalone_dir,
+        );
     }
 }
 
@@ -409,6 +457,71 @@ pub async fn status(
                     format_version_opt(current_backend_version.as_deref()),
                     format_version_opt(latest_backend_version.as_deref())
                 );
+            }
+        }
+    }
+
+    // standalone (project-local, optional)
+    let standalone_dir = cwd.join(PROJECT_STANDALONE_DIR);
+    let current_standalone = project_manifest
+        .as_ref()
+        .and_then(|m| m.standalone.as_ref());
+    let standalone_tracked = current_standalone
+        .is_some_and(|bundle| bundle.install_dir == PathBuf::from(PROJECT_STANDALONE_DIR));
+    if !standalone_tracked && standalone_dir.exists() {
+        if let Some(issue) = standalone_install_layout_issue(&standalone_dir) {
+            println!("standalone: invalid layout on disk, not tracked in manifest: {issue}");
+        } else {
+            println!("standalone: installed on disk, not tracked in manifest");
+        }
+    } else if standalone_tracked && !standalone_dir.exists() {
+        println!("standalone: not installed");
+    } else if standalone_tracked
+        && standalone_dir.exists()
+        && let Some(issue) = standalone_install_layout_issue(&standalone_dir)
+    {
+        println!("standalone: invalid layout on disk: {issue}");
+    } else {
+        let current_standalone_version =
+            current_standalone.and_then(|bundle| standalone_version_from_asset_url(&bundle.url));
+        let latest_standalone = github_releases::latest_standalone_from_releases(
+            paths,
+            &project.edition,
+            no_cache,
+            prerelease,
+            current_standalone_version.as_deref(),
+            None,
+        )
+        .await;
+        let latest_standalone_version = latest_standalone
+            .as_ref()
+            .ok()
+            .and_then(|bundle| bundle.as_ref())
+            .and_then(|bundle| standalone_version_from_asset_url(&bundle.url));
+        match (current_standalone, latest_standalone) {
+            (_, Err(_)) => println!("standalone: unknown (cannot check latest)"),
+            (None, Ok(None)) => println!("standalone: not installed"),
+            (None, Ok(Some(_))) => println!("standalone: not installed"),
+            (Some(_), Ok(None)) => println!("standalone: installed, but no release available now"),
+            (Some(current), Ok(Some(latest))) => {
+                let current_sha = current.sha256.as_deref();
+                let latest_sha = latest.sha256.as_deref();
+                if current_sha == latest_sha && current.url == latest.url {
+                    if let Some(version) = current_standalone_version
+                        .as_deref()
+                        .or(latest_standalone_version.as_deref())
+                    {
+                        println!("standalone: up to date ({})", format_version(version));
+                    } else {
+                        println!("standalone: up to date");
+                    }
+                } else {
+                    println!(
+                        "standalone: update available ({} -> {})",
+                        format_version_opt(current_standalone_version.as_deref()),
+                        format_version_opt(latest_standalone_version.as_deref())
+                    );
+                }
             }
         }
     }
@@ -733,6 +846,10 @@ fn backend_version_from_asset_url(url: &str) -> Option<String> {
     github_releases::backend_version_from_asset_url(url)
 }
 
+fn standalone_version_from_asset_url(url: &str) -> Option<String> {
+    github_releases::standalone_version_from_asset_url(url)
+}
+
 fn wrapper_version_from_asset_url(wrapper_id: &str, url: &str) -> Option<String> {
     github_releases::wrapper_version_from_asset_url(wrapper_id, url)
 }
@@ -741,19 +858,25 @@ fn wrapper_version_from_asset_url(wrapper_id: &str, url: &str) -> Option<String>
 mod tests {
     use super::{
         auth_version_from_asset_url, backend_version_from_asset_url, format_version_opt,
-        parse_version_from_cli_output, wrapper_version_from_asset_url,
+        parse_version_from_cli_output, standalone_version_from_asset_url,
+        wrapper_version_from_asset_url,
     };
 
     #[test]
     fn parses_versions_from_asset_urls() {
         let auth = "https://api.github.com/repos/INIT-SGGW/HackArena-Auth-Cli/releases/assets/1?asset_name=ha-auth-v0.2.0-x86_64-pc-windows-msvc.exe";
         let backend = "https://api.github.com/repos/INIT-SGGW/HackArena3.0-Backend/releases/assets/2?asset_name=ha3-backend-local-x86_64-pc-windows-msvc-v0.1.0-beta.1.zip";
+        let standalone = "https://api.github.com/repos/INIT-SGGW/HackArena3.0-Backend/releases/assets/4?asset_name=ha3-standalone-x86_64-pc-windows-msvc-v0.2.0-beta.14.zip";
         let wrapper = "https://api.github.com/repos/INIT-SGGW/HackArena3.0-ApiWrapper-Python/releases/assets/3?asset_name=wrapper-python-v0.1.0b3.zip";
 
         assert_eq!(auth_version_from_asset_url(auth).as_deref(), Some("0.2.0"));
         assert_eq!(
             backend_version_from_asset_url(backend).as_deref(),
             Some("0.1.0-beta.1")
+        );
+        assert_eq!(
+            standalone_version_from_asset_url(standalone).as_deref(),
+            Some("0.2.0-beta.14")
         );
         assert_eq!(
             wrapper_version_from_asset_url("python", wrapper).as_deref(),

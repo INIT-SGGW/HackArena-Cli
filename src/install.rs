@@ -6,7 +6,7 @@ use crate::config::{
     load_project_manifest, project_meta_dir, save_project_config, save_project_manifest,
     validate_edition,
 };
-use crate::constants::{PROJECT_BACKEND_DIR, PROJECT_WRAPPERS_DIR};
+use crate::constants::{PROJECT_BACKEND_DIR, PROJECT_STANDALONE_DIR, PROJECT_WRAPPERS_DIR};
 use crate::download::{download_to_cache, sha256_file_hex};
 use crate::error::HackArenaError;
 use crate::github_releases::{self, LinuxLibcMode};
@@ -458,6 +458,87 @@ pub async fn install_backend(
     Ok(())
 }
 
+/// Installs standalone bundle into `./standalone` (project-local).
+pub async fn install_standalone(
+    paths: &Paths,
+    no_cache: bool,
+    prerelease: bool,
+    linux_libc: Option<LinuxLibcMode>,
+) -> Result<(), HackArenaError> {
+    let cwd = std::env::current_dir().map_err(HackArenaError::Io)?;
+    let project = if is_project_dir(&cwd) {
+        load_project_config(&cwd)?
+    } else {
+        return Err(HackArenaError::msg(format!(
+            "No project found. Run `{}` first.",
+            cmd_hint::run_cli("use <edition>")
+        )));
+    };
+    validate_edition(&project.edition)?;
+
+    let Some(latest_standalone) = github_releases::latest_standalone_from_releases(
+        paths,
+        &project.edition,
+        no_cache,
+        prerelease,
+        None,
+        linux_libc,
+    )
+    .await?
+    else {
+        return Err(HackArenaError::msg(format!(
+            "No standalone release is available yet for edition `{}`.",
+            project.edition
+        )));
+    };
+
+    let mut manifest = load_project_manifest(&cwd)?;
+    let standalone_dir = cwd.join(PROJECT_STANDALONE_DIR);
+    if standalone_dir.exists() {
+        if standalone_dir_needs_repair(&manifest, &standalone_dir)? {
+            println!(
+                "Standalone exists at {} but looks incomplete/untracked. Reinstalling.",
+                standalone_dir.display()
+            );
+            install_standalone_to_dir(
+                paths,
+                &standalone_dir,
+                &latest_standalone.url,
+                latest_standalone.sha256.as_deref(),
+                true,
+                standalone_dir.join("standalone.toml").is_file(),
+            )
+            .await?;
+            manifest.standalone = Some(project_installed_bundle(
+                &latest_standalone.url,
+                PROJECT_STANDALONE_DIR,
+                latest_standalone.sha256.clone(),
+            ));
+            save_project_manifest(&cwd, &manifest)?;
+            return Ok(());
+        }
+        println!("Standalone already exists at {}", standalone_dir.display());
+        return Ok(());
+    }
+
+    install_standalone_to_dir(
+        paths,
+        &standalone_dir,
+        &latest_standalone.url,
+        latest_standalone.sha256.as_deref(),
+        false,
+        false,
+    )
+    .await?;
+    manifest.standalone = Some(project_installed_bundle(
+        &latest_standalone.url,
+        PROJECT_STANDALONE_DIR,
+        latest_standalone.sha256.clone(),
+    ));
+    save_project_manifest(&cwd, &manifest)?;
+    Ok(())
+}
+
 /// Installs a wrapper by id into `./wrappers/<wrapper_id>` (project-local).
 pub async fn install_wrapper(
     paths: &Paths,
@@ -569,6 +650,85 @@ pub async fn install_wrapper(
             files: vec![],
         },
     );
+    save_project_manifest(&cwd, &manifest)?;
+    Ok(())
+}
+
+pub async fn update_standalone(
+    paths: &Paths,
+    no_cache: bool,
+    prerelease: bool,
+    linux_libc: Option<LinuxLibcMode>,
+) -> Result<(), HackArenaError> {
+    let cwd = std::env::current_dir().map_err(HackArenaError::Io)?;
+    if !is_project_dir(&cwd) {
+        return Err(HackArenaError::msg(format!(
+            "No `./.hackarena/project.json` found. Run `{}` first.",
+            cmd_hint::run_cli("install")
+        )));
+    }
+
+    let project = load_project_config(&cwd)?;
+    validate_edition(&project.edition)?;
+    let mut manifest = load_project_manifest(&cwd)?;
+    let standalone_dir = cwd.join(PROJECT_STANDALONE_DIR);
+    let current_standalone = manifest.standalone.as_ref();
+    let current_version = current_standalone
+        .and_then(|bundle| github_releases::standalone_version_from_asset_url(&bundle.url));
+    let Some(latest_standalone) = github_releases::latest_standalone_from_releases(
+        paths,
+        &project.edition,
+        no_cache,
+        prerelease,
+        current_version.as_deref(),
+        linux_libc,
+    )
+    .await?
+    else {
+        if current_standalone.is_some() {
+            println!("Standalone is installed, but no release is available now.");
+            return Ok(());
+        }
+        return Err(HackArenaError::msg(format!(
+            "No standalone release is available yet for edition `{}`.",
+            project.edition
+        )));
+    };
+
+    let tracked = current_standalone
+        .is_some_and(|bundle| bundle.install_dir == PathBuf::from(PROJECT_STANDALONE_DIR));
+    if !tracked {
+        return Err(HackArenaError::msg(format!(
+            "Standalone is not tracked in `./.hackarena/manifest.json`. Run `{}` first.",
+            cmd_hint::run_cli("install standalone")
+        )));
+    }
+
+    let layout_ok =
+        standalone_dir.exists() && validate_standalone_install_layout(&standalone_dir).is_ok();
+    if layout_ok
+        && let Some(current) = current_standalone
+        && current.sha256.as_deref() == latest_standalone.sha256.as_deref()
+        && current.url == latest_standalone.url
+    {
+        println!("Standalone is already up to date.");
+        return Ok(());
+    }
+
+    install_standalone_to_dir(
+        paths,
+        &standalone_dir,
+        &latest_standalone.url,
+        latest_standalone.sha256.as_deref(),
+        true,
+        standalone_dir.join("standalone.toml").is_file(),
+    )
+    .await?;
+    manifest.standalone = Some(project_installed_bundle(
+        &latest_standalone.url,
+        PROJECT_STANDALONE_DIR,
+        latest_standalone.sha256.clone(),
+    ));
     save_project_manifest(&cwd, &manifest)?;
     Ok(())
 }
@@ -841,6 +1001,74 @@ async fn install_backend_to_dir(
         println!("Updated backend at {}", install_dir.display());
     } else {
         println!("Installed backend to {}", install_dir.display());
+    }
+    Ok(())
+}
+
+async fn install_standalone_to_dir(
+    paths: &Paths,
+    install_dir: &Path,
+    standalone_url: &str,
+    standalone_sha: Option<&str>,
+    force_replace: bool,
+    preserve_existing_toml: bool,
+) -> Result<(), HackArenaError> {
+    ensure_dir(&paths.downloads_cache_dir())?;
+    if let Some(parent) = install_dir.parent() {
+        ensure_dir(parent)?;
+    }
+
+    if install_dir.exists() && !force_replace {
+        return Err(HackArenaError::msg(format!(
+            "Standalone directory already exists at {}",
+            install_dir.display()
+        )));
+    }
+
+    let cache_filename =
+        filename_from_url(standalone_url).unwrap_or_else(|| "standalone.zip".to_string());
+    let standalone_sha = standalone_sha.ok_or_else(|| {
+        HackArenaError::msg("Resolved standalone release is missing SHA256 metadata.")
+    })?;
+
+    println!("Downloading standalone...");
+    let cached = download_to_cache(paths, standalone_url, &cache_filename, standalone_sha).await?;
+    println!("Installing standalone...");
+    deploy_standalone_archive(&cached, install_dir, preserve_existing_toml)?;
+    validate_standalone_install_layout(install_dir)?;
+    ensure_executable(&install_dir.join(standalone_executable_name()))?;
+
+    if preserve_existing_toml {
+        println!(
+            "Updated standalone at {} (preserved `standalone.toml`).",
+            install_dir.display()
+        );
+    } else {
+        println!("Installed standalone to {}", install_dir.display());
+    }
+    Ok(())
+}
+
+fn deploy_standalone_archive(
+    archive_path: &Path,
+    install_dir: &Path,
+    preserve_existing_toml: bool,
+) -> Result<(), HackArenaError> {
+    let existing_toml = install_dir.join("standalone.toml");
+    let should_restore_toml = preserve_existing_toml && existing_toml.is_file();
+    let backup_dir = tempfile::tempdir().map_err(HackArenaError::Io)?;
+    let backup_toml = backup_dir.path().join("standalone.toml");
+    if should_restore_toml {
+        std::fs::copy(&existing_toml, &backup_toml)
+            .map_err(|e| HackArenaError::io_with_path(&backup_toml, e))?;
+    }
+
+    recreate_dir(install_dir)?;
+    extract_archive(archive_path, install_dir)?;
+
+    if should_restore_toml {
+        std::fs::copy(&backup_toml, &existing_toml)
+            .map_err(|e| HackArenaError::io_with_path(&existing_toml, e))?;
     }
     Ok(())
 }
@@ -1162,6 +1390,44 @@ fn copy_dir_recursive(src: &Path, dst: &Path) -> Result<(), HackArenaError> {
         }
     }
     Ok(())
+}
+
+pub(crate) fn standalone_install_layout_issue(install_dir: &Path) -> Option<String> {
+    let executable = install_dir.join(standalone_executable_name());
+    if !executable.is_file() {
+        return Some(format!(
+            "missing `{}` in {}",
+            standalone_executable_name(),
+            install_dir.display()
+        ));
+    }
+
+    let config_path = install_dir.join("standalone.toml");
+    if !config_path.is_file() {
+        return Some(format!(
+            "missing `standalone.toml` in {}",
+            install_dir.display()
+        ));
+    }
+
+    None
+}
+
+pub(crate) fn validate_standalone_install_layout(install_dir: &Path) -> Result<(), HackArenaError> {
+    if let Some(issue) = standalone_install_layout_issue(install_dir) {
+        return Err(HackArenaError::msg(format!(
+            "Standalone has invalid layout: {issue}."
+        )));
+    }
+    Ok(())
+}
+
+fn standalone_executable_name() -> &'static str {
+    if cfg!(windows) {
+        "ha3-standalone.exe"
+    } else {
+        "ha3-standalone"
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1977,6 +2243,20 @@ async fn resolve_project_backend_manifest(
     }))
 }
 
+fn project_installed_bundle(
+    url: &str,
+    install_dir: &str,
+    sha256: Option<String>,
+) -> ProjectInstalledBundle {
+    ProjectInstalledBundle {
+        url: url.to_string(),
+        install_dir: PathBuf::from(install_dir),
+        sha256,
+        installed_at_unix: Some(unix_time_seconds()),
+        files: vec![],
+    }
+}
+
 fn filename_from_url(url: &str) -> Option<String> {
     if let Some((_, query)) = url.split_once('?') {
         for item in query.split('&') {
@@ -2066,6 +2346,20 @@ fn backend_dir_needs_repair(
         .is_some_and(|b| b.install_dir == backend_rel_path);
     let has_files = dir_has_entries(backend_abs_path)?;
     Ok(!tracked || !has_files)
+}
+
+fn standalone_dir_needs_repair(
+    manifest: &ProjectManifest,
+    standalone_abs_path: &Path,
+) -> Result<bool, HackArenaError> {
+    let tracked = manifest
+        .standalone
+        .as_ref()
+        .is_some_and(|bundle| bundle.install_dir == PathBuf::from(PROJECT_STANDALONE_DIR));
+    if !tracked {
+        return Ok(true);
+    }
+    Ok(standalone_install_layout_issue(standalone_abs_path).is_some())
 }
 
 fn dir_has_entries(path: &Path) -> Result<bool, HackArenaError> {
@@ -2308,14 +2602,15 @@ fn unix_time_seconds() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::{
-        choose_wrapper_id, csharp_runtime_version_from_nupkg_url, deploy_wrapper_archive,
-        ensure_cpp_cmakelists_runtime_include, ensure_csharp_bot_csproj_package_reference,
-        ensure_csharp_nuget_config, ensure_python_requirements_has_wheel,
-        ensure_python_wrapper_env_api_url, ensure_typescript_package_json_dependency,
-        ensure_wrapper_install_allowed, typescript_runtime_package_name_from_tgz,
-        validate_wrapper_install_layout, vendor_cpp_sdk_archive, vendor_csharp_nupkg,
-        vendor_python_wheel, vendor_typescript_tgz, visible_wrapper_ids_for_install,
-        wrapper_choices_for_edition,
+        choose_wrapper_id, csharp_runtime_version_from_nupkg_url, deploy_standalone_archive,
+        deploy_wrapper_archive, ensure_cpp_cmakelists_runtime_include,
+        ensure_csharp_bot_csproj_package_reference, ensure_csharp_nuget_config,
+        ensure_python_requirements_has_wheel, ensure_python_wrapper_env_api_url,
+        ensure_typescript_package_json_dependency, ensure_wrapper_install_allowed,
+        standalone_install_layout_issue, typescript_runtime_package_name_from_tgz,
+        validate_standalone_install_layout, validate_wrapper_install_layout,
+        vendor_cpp_sdk_archive, vendor_csharp_nupkg, vendor_python_wheel, vendor_typescript_tgz,
+        visible_wrapper_ids_for_install, wrapper_choices_for_edition,
     };
     use crate::config::{ArtifactSpec, EditionConfig, ProjectConfig, WrapperSpec};
     use flate2::Compression;
@@ -2467,6 +2762,80 @@ mod tests {
 
         let err = validate_wrapper_install_layout("python", dir.path()).expect_err("should fail");
         assert!(err.to_string().contains("missing `manifest.toml`"));
+    }
+
+    #[test]
+    fn standalone_layout_validation_accepts_expected_files() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        fs::write(dir.path().join("standalone.toml"), "port = 8080\n").expect("write config");
+        fs::write(
+            dir.path().join(if cfg!(windows) {
+                "ha3-standalone.exe"
+            } else {
+                "ha3-standalone"
+            }),
+            "bin",
+        )
+        .expect("write executable");
+
+        validate_standalone_install_layout(dir.path()).expect("layout should pass");
+        assert!(standalone_install_layout_issue(dir.path()).is_none());
+    }
+
+    #[test]
+    fn standalone_layout_validation_fails_when_config_missing() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        fs::write(
+            dir.path().join(if cfg!(windows) {
+                "ha3-standalone.exe"
+            } else {
+                "ha3-standalone"
+            }),
+            "bin",
+        )
+        .expect("write executable");
+
+        let err = validate_standalone_install_layout(dir.path()).expect_err("should fail");
+        assert!(err.to_string().contains("standalone.toml"));
+    }
+
+    #[test]
+    fn standalone_deploy_preserves_existing_toml() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let install_dir = dir.path().join("standalone");
+        fs::create_dir_all(install_dir.join("assets")).expect("mkdir");
+        fs::write(install_dir.join("standalone.toml"), "port = 9999\n").expect("write config");
+        fs::write(
+            install_dir.join(if cfg!(windows) {
+                "ha3-standalone.exe"
+            } else {
+                "ha3-standalone"
+            }),
+            "old",
+        )
+        .expect("write exe");
+
+        let archive = dir.path().join("standalone.zip");
+        let exe_name = if cfg!(windows) {
+            "ha3-standalone.exe"
+        } else {
+            "ha3-standalone"
+        };
+        create_wrapper_zip(
+            &archive,
+            &[
+                (exe_name, "new"),
+                ("standalone.toml", "port = 8080\n"),
+                ("frontend/index.html", "<html></html>"),
+            ],
+        );
+
+        deploy_standalone_archive(&archive, &install_dir, true).expect("deploy standalone");
+
+        let config = fs::read_to_string(install_dir.join("standalone.toml")).expect("read config");
+        assert_eq!(config, "port = 9999\n");
+        let exe = fs::read_to_string(install_dir.join(exe_name)).expect("read exe");
+        assert_eq!(exe, "new");
     }
 
     #[test]

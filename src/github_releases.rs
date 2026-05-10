@@ -2,7 +2,7 @@ use crate::config::{
     ArtifactSpec, BackendConfig, BackendSource, EditionConfig, Paths, ProjectInstalledBundle,
     WrapperSpec, ensure_dir,
 };
-use crate::constants::{PROJECT_BACKEND_DIR, PROJECT_WRAPPERS_DIR};
+use crate::constants::{PROJECT_BACKEND_DIR, PROJECT_STANDALONE_DIR, PROJECT_WRAPPERS_DIR};
 use crate::error::HackArenaError;
 use crate::github_http::{self, GITHUB_BINARY_ACCEPT, GITHUB_JSON_ACCEPT, GithubGetOutcome};
 use semver::Version;
@@ -126,6 +126,7 @@ struct EditionRepos {
 enum ComponentSelector<'a> {
     Auth,
     Backend,
+    Standalone,
     Wrapper(&'a str),
     HackArenaCli,
 }
@@ -319,6 +320,46 @@ pub async fn latest_backend_from_releases(
     Ok(Some(ProjectInstalledBundle {
         url: asset.url,
         install_dir: PathBuf::from(PROJECT_BACKEND_DIR),
+        sha256: Some(asset.sha256),
+        installed_at_unix: None,
+        files: vec![],
+    }))
+}
+
+pub async fn latest_standalone_from_releases(
+    paths: &Paths,
+    edition: &str,
+    no_cache: bool,
+    prerelease: bool,
+    current_version: Option<&str>,
+    linux_libc_override: Option<LinuxLibcMode>,
+) -> Result<Option<ProjectInstalledBundle>, HackArenaError> {
+    let repos = repos_for_edition(edition).ok_or_else(|| {
+        HackArenaError::msg(format!(
+            "GitHub Releases mapping is not configured for edition `{edition}`"
+        ))
+    })?;
+    let Some(repo) = repos.backend_repo else {
+        return Ok(None);
+    };
+    let target = current_target_triples(linux_libc_override)?;
+    let use_cache = !no_cache;
+    let Some(asset) = resolve_optional_component(
+        paths,
+        repo,
+        ComponentSelector::Standalone,
+        &target,
+        use_cache,
+        prerelease,
+        current_version,
+    )
+    .await?
+    else {
+        return Ok(None);
+    };
+    Ok(Some(ProjectInstalledBundle {
+        url: asset.url,
+        install_dir: PathBuf::from(PROJECT_STANDALONE_DIR),
         sha256: Some(asset.sha256),
         installed_at_unix: None,
         files: vec![],
@@ -2087,6 +2128,7 @@ fn is_component_asset(name: &str, component: ComponentSelector<'_>, triple: &str
                 && is_auth_extension(&lower)
         }
         ComponentSelector::Backend => is_backend_local_asset(&lower, triple),
+        ComponentSelector::Standalone => is_standalone_asset(&lower, triple),
         ComponentSelector::Wrapper(wrapper_id) => {
             is_wrapper_platform_asset(&lower, wrapper_id, triple)
                 || is_wrapper_universal_asset(&lower, wrapper_id)
@@ -2102,6 +2144,9 @@ fn expected_pattern(component: ComponentSelector<'_>, triple: &str) -> String {
         ComponentSelector::Auth => format!("ha-auth-v<version>-{triple}.<exe|zip|tar.gz>"),
         ComponentSelector::Backend => {
             format!("*-backend-local-{triple}-v<version>.<zip|tar.gz>")
+        }
+        ComponentSelector::Standalone => {
+            format!("ha3-standalone-{triple}-v<version>.<zip|tar.gz>")
         }
         ComponentSelector::Wrapper(wrapper_id) => {
             if wrapper_id.eq_ignore_ascii_case("typescript") {
@@ -2123,6 +2168,7 @@ fn component_name(component: ComponentSelector<'_>) -> String {
     match component {
         ComponentSelector::Auth => "auth".to_string(),
         ComponentSelector::Backend => "backend".to_string(),
+        ComponentSelector::Standalone => "standalone".to_string(),
         ComponentSelector::Wrapper(wrapper_id) => format!("wrapper `{wrapper_id}`"),
         ComponentSelector::HackArenaCli => "hackarena CLI".to_string(),
     }
@@ -2139,6 +2185,14 @@ fn is_auth_extension(name_lower: &str) -> bool {
 fn is_backend_local_asset(name_lower: &str, triple: &str) -> bool {
     let triple_part = format!("-{}", triple.to_ascii_lowercase());
     name_lower.contains("-backend-local-")
+        && name_lower.contains(&triple_part)
+        && name_lower.contains("-v")
+        && is_archive_extension(name_lower)
+}
+
+fn is_standalone_asset(name_lower: &str, triple: &str) -> bool {
+    let triple_part = format!("-{}", triple.to_ascii_lowercase());
+    name_lower.starts_with("ha3-standalone-")
         && name_lower.contains(&triple_part)
         && name_lower.contains("-v")
         && is_archive_extension(name_lower)
@@ -2595,6 +2649,24 @@ pub fn backend_version_from_asset_url(url: &str) -> Option<String> {
     }
 }
 
+pub fn standalone_version_from_asset_url(url: &str) -> Option<String> {
+    let asset = asset_name_from_url(url)?;
+    let stem = strip_asset_extension(&asset);
+    let prefix = "ha3-standalone-";
+    let stem_lower = stem.to_ascii_lowercase();
+    if !stem_lower.starts_with(prefix) {
+        return None;
+    }
+    let idx = stem_lower.rfind("-v")?;
+    let version = &stem[idx + 2..];
+    let normalized = normalize_version_string(version);
+    if normalized.is_empty() {
+        None
+    } else {
+        Some(normalized)
+    }
+}
+
 pub fn wrapper_version_from_asset_url(wrapper_id: &str, url: &str) -> Option<String> {
     let asset = asset_name_from_url(url)?;
     let stem = strip_asset_extension(&asset);
@@ -2765,10 +2837,20 @@ bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb *ha3-backend-lo
             ComponentSelector::Backend,
             "x86_64-pc-windows-msvc"
         ));
+        assert!(is_component_asset(
+            "ha3-standalone-x86_64-pc-windows-msvc-v0.2.0-beta.14.zip",
+            ComponentSelector::Standalone,
+            "x86_64-pc-windows-msvc"
+        ));
         assert!(!is_component_asset(
             "ha3-backend-official-x86_64-pc-windows-msvc-v0.1.0-beta.1.zip",
             ComponentSelector::Backend,
             "x86_64-pc-windows-msvc"
+        ));
+        assert!(!is_component_asset(
+            "ha3-standalone-x86_64-pc-windows-msvc-v0.2.0-beta.14.zip",
+            ComponentSelector::Standalone,
+            "aarch64-pc-windows-msvc"
         ));
         assert!(is_component_asset(
             "wrapper-python-v0.1.0-x86_64-unknown-linux-musl.zip",

@@ -193,6 +193,17 @@ pub enum InstallSubcommand {
         prerelease: bool,
     },
 
+    /// Install standalone bundle for local game hosting.
+    Standalone {
+        /// Do not use cached release metadata (always fetch from network).
+        #[arg(long)]
+        no_cache: bool,
+
+        /// Allow prerelease versions during release selection.
+        #[arg(long)]
+        prerelease: bool,
+    },
+
     /// Install a wrapper bundle by id.
     Wrapper {
         /// Wrapper id (e.g. `python`, `python_1`; legacy ids require `--experimental`). If omitted, CLI will show available wrappers.
@@ -231,6 +242,17 @@ pub enum UpdateSubcommand {
 
     /// Update only backend.
     Backend {
+        /// Do not use cached release metadata (always fetch from network).
+        #[arg(long)]
+        no_cache: bool,
+
+        /// Allow prerelease versions during release selection.
+        #[arg(long)]
+        prerelease: bool,
+    },
+
+    /// Update standalone bundle for local game hosting.
+    Standalone {
         /// Do not use cached release metadata (always fetch from network).
         #[arg(long)]
         no_cache: bool,

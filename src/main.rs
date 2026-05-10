@@ -81,6 +81,18 @@ impl Command {
                     )
                     .await?
                 }
+                Some(UpdateSubcommand::Standalone {
+                    no_cache: sub_no_cache,
+                    prerelease: sub_prerelease,
+                }) => {
+                    install::update_standalone(
+                        paths,
+                        *no_cache || *sub_no_cache,
+                        *prerelease || *sub_prerelease,
+                        linux_libc.map(Into::into),
+                    )
+                    .await?
+                }
                 Some(UpdateSubcommand::Wrapper {
                     wrapper_id,
                     no_cache: sub_no_cache,
@@ -135,6 +147,18 @@ impl Command {
                     prerelease: sub_prerelease,
                 }) => {
                     install::install_backend(
+                        paths,
+                        *no_cache || *sub_no_cache,
+                        *prerelease || *sub_prerelease,
+                        linux_libc.map(Into::into),
+                    )
+                    .await?
+                }
+                Some(InstallSubcommand::Standalone {
+                    no_cache: sub_no_cache,
+                    prerelease: sub_prerelease,
+                }) => {
+                    install::install_standalone(
                         paths,
                         *no_cache || *sub_no_cache,
                         *prerelease || *sub_prerelease,

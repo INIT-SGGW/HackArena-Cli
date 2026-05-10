@@ -34,6 +34,14 @@ pub async fn clean(
                 ));
             }
 
+            if let Some(standalone) = m.standalone.as_ref() {
+                items.push(CleanItem::dir(
+                    "project standalone",
+                    cwd.join(&standalone.install_dir),
+                    standalone.installed_at_unix,
+                ));
+            }
+
             for (wrapper_id, wrapper) in &m.wrappers {
                 items.push(CleanItem::dir(
                     &format!("project wrapper `{wrapper_id}`"),
@@ -231,6 +239,8 @@ fn sort_key(label: &str) -> (u8, u8, String) {
     } else if label.contains("wrapper") {
         1
     } else if label.contains("backend") {
+        1
+    } else if label.contains("standalone") {
         1
     } else if label.contains("downloads cache") {
         0

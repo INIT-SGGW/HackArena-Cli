@@ -12,6 +12,8 @@ pub struct ProjectManifest {
     #[serde(default)]
     pub backend: Option<ProjectInstalledBundle>,
     #[serde(default)]
+    pub standalone: Option<ProjectInstalledBundle>,
+    #[serde(default)]
     pub wrappers: BTreeMap<String, ProjectInstalledBundle>,
 
     // Backward-compat for older manifests that stored a single wrapper.
@@ -78,4 +80,28 @@ pub fn save_project_manifest(
         .map_err(|e| HackArenaError::json_with_path(&path, e))?;
     fs::write(&path, data).map_err(|e| HackArenaError::io_with_path(&path, e))?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::ProjectManifest;
+
+    #[test]
+    fn manifest_defaults_when_standalone_is_absent() {
+        let manifest: ProjectManifest = serde_json::from_str(
+            r#"{
+  "backend": {
+    "url": "https://example.test/backend.zip",
+    "install_dir": "backend",
+    "sha256": "abc",
+    "installed_at_unix": 1,
+    "files": []
+  },
+  "wrappers": {}
+}"#,
+        )
+        .expect("manifest should deserialize");
+
+        assert!(manifest.standalone.is_none());
+    }
 }

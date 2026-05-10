@@ -14,5 +14,8 @@ pub const PROJECT_MANIFEST_FILE: &str = "manifest.json";
 /// Project-local backend directory name (relative to project root).
 pub const PROJECT_BACKEND_DIR: &str = "backend";
 
+/// Project-local standalone directory name (relative to project root).
+pub const PROJECT_STANDALONE_DIR: &str = "standalone";
+
 /// Project-local wrappers directory name (relative to project root).
 pub const PROJECT_WRAPPERS_DIR: &str = "wrappers";
