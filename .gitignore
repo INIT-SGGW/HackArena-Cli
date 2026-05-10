@@ -24,4 +24,5 @@ target
 /.hackarena/
 /backend/
 /wrappers/
+/standalone/
 /deploy/
