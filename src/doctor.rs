@@ -39,21 +39,41 @@ pub async fn doctor(
 ) -> Result<(), HackArenaError> {
     let cwd = std::env::current_dir().map_err(HackArenaError::Io)?;
     print_header("hackarena doctor");
-    println!("Project dir: {}", cwd.display());
     let Some(project) = load_project_or_warn(&cwd, "install")? else {
         return Ok(());
     };
-    let project_path = project_config_path(&cwd);
-    print_check("project.json", project_path.exists(), &project_path);
+    let auth_path = paths.bin_dir.join(if cfg!(windows) {
+        "ha-auth.exe"
+    } else {
+        "ha-auth"
+    });
+    let backend_dir = cwd.join(&project.backend_dir);
+    let manifest = load_project_manifest(&cwd).unwrap_or_default();
+    let wrapper_disk_entries = discover_wrapper_disk_entries(&cwd, &project.edition, &manifest);
 
-    let edition_ok = validate_edition(&project.edition).is_ok();
-    print_check_value("edition", edition_ok, &project.edition);
+    println!("Project dir: {}", cwd.display());
+    println!("Edition: {}", project.edition);
     println!();
 
-    let manifest_path = project_manifest_path(&cwd);
-    print_check("manifest.json", manifest_path.exists(), &manifest_path);
+    println!("Project");
+    print_check(
+        "project.json",
+        project_config_path(&cwd).exists(),
+        &project_config_path(&cwd),
+    );
+    print_check(
+        "manifest.json",
+        project_manifest_path(&cwd).exists(),
+        &project_manifest_path(&cwd),
+    );
+    print_check_value(
+        "edition",
+        validate_edition(&project.edition).is_ok(),
+        &project.edition,
+    );
+    println!();
 
-    let _config = load_effective_config(paths, &project, no_cache, prerelease).await?;
+    println!("Environment");
     println!("Artifact source: GitHub Releases");
     print_github_auth_status(paths)?;
     if verbose {
@@ -61,33 +81,48 @@ pub async fn doctor(
     }
     println!();
 
-    let auth_path = paths.bin_dir.join(if cfg!(windows) {
-        "ha-auth.exe"
-    } else {
-        "ha-auth"
-    });
-    print_check("global ha-auth", auth_path.exists(), &auth_path);
-
-    let backend_dir = cwd.join(&project.backend_dir);
-    print_check("backend", backend_dir.exists(), &backend_dir);
-
-    print_check(
+    println!("Components");
+    print_check_with_action(
+        "global ha-auth",
+        auth_path.exists(),
+        &auth_path,
+        Some(cmd_hint::run_cli("install auth")),
+    );
+    print_check_with_action(
+        "backend",
+        backend_dir.exists(),
+        &backend_dir,
+        Some(cmd_hint::run_cli("install backend")),
+    );
+    print_check_with_action(
         "wrappers/",
         cwd.join("wrappers").exists(),
         &cwd.join("wrappers"),
+        Some(cmd_hint::run_cli("install wrapper")),
     );
-    let manifest = load_project_manifest(&cwd).unwrap_or_default();
-    let wrapper_disk_entries = discover_wrapper_disk_entries(&cwd, &project.edition, &manifest);
+    println!();
+
+    println!("Wrappers");
+    let mut printed_wrapper_section = false;
     for wrapper_id in manifest.wrappers.keys() {
         if github_releases::is_experimental_wrapper(&project.edition, wrapper_id) {
+            printed_wrapper_section = true;
             print_experimental_wrapper_note(wrapper_id, &project.edition);
+            print_action(&format!(
+                "submit is unsupported for this wrapper in edition {}; local install/update only",
+                project.edition
+            ));
         }
     }
     for entry in wrapper_disk_entries
         .iter()
         .filter(|entry| entry.is_untracked())
     {
+        printed_wrapper_section = true;
         print_untracked_wrapper_warning(entry);
+    }
+    if !printed_wrapper_section {
+        println!("wrapper: no additional diagnostics");
     }
 
     Ok(())
@@ -116,22 +151,6 @@ fn load_project_or_warn(
         return Ok(None);
     }
     Ok(Some(load_project_config(cwd)?))
-}
-
-async fn load_effective_config(
-    paths: &Paths,
-    project: &crate::config::ProjectConfig,
-    no_cache: bool,
-    prerelease: bool,
-) -> Result<crate::config::EditionConfig, HackArenaError> {
-    github_releases::load_edition_config_from_cache(
-        paths,
-        &project.edition,
-        no_cache,
-        prerelease,
-        None,
-    )
-    .await
 }
 
 fn print_check(label: &str, ok: bool, path: &Path) {
@@ -177,6 +196,17 @@ fn print_warn(label: &str, status: &str, path: &Path) {
         println!("{label}: {} ({})", status.yellow(), path.display());
     } else {
         println!("{label}: {status} ({})", path.display());
+    }
+}
+
+fn print_action(action: &str) {
+    println!("  -> {action}");
+}
+
+fn print_check_with_action(label: &str, ok: bool, path: &Path, action: Option<String>) {
+    print_check(label, ok, path);
+    if !ok && let Some(action) = action {
+        print_action(&format!("run `{action}`"));
     }
 }
 
@@ -256,30 +286,9 @@ pub async fn status(
     let Some(project) = load_project_or_warn(&cwd, "install")? else {
         return Ok(());
     };
-    let config = load_effective_config(paths, &project, no_cache, prerelease).await?;
 
-    println!("Project dir: {}", cwd.display());
     println!("Edition: {}", project.edition);
     println!();
-
-    let wrappers_dir = cwd.join("wrappers");
-    println!("Wrappers dir: {}", wrappers_dir.display());
-    println!("Global ha-auth: {}", paths.bin_dir.display());
-    println!();
-
-    println!("Auth URL:    {}", config.auth_artifact.filename);
-
-    match config.backend.as_ref() {
-        None => {
-            println!("Backend:     <not configured for this edition>");
-        }
-        Some(backend) => {
-            match &backend.source {
-                crate::config::BackendSource::Url { url } => println!("Backend URL: {url}"),
-            }
-            println!("Backend dir: {}", cwd.join(&project.backend_dir).display());
-        }
-    }
 
     let project_manifest = load_project_manifest(&cwd).ok();
     let wrapper_disk_entries = project_manifest
@@ -294,11 +303,9 @@ pub async fn status(
         });
 
     if verbose {
-        println!();
+        println!("Project dir: {}", cwd.display());
         print_verbose_runtime(paths, no_cache, prerelease);
-        println!(
-            "Update check uses GitHub Releases metadata. For private repos or higher rate limits, run `hackarena github login` or set GH_TOKEN/GITHUB_TOKEN."
-        );
+        println!();
     }
 
     let project_manifest = match load_project_manifest(&cwd) {
@@ -307,7 +314,11 @@ pub async fn status(
     };
 
     // auth (global)
-    let auth_path = paths.bin_dir.join(&config.bin_name_auth);
+    let auth_path = paths.bin_dir.join(if cfg!(windows) {
+        "ha-auth.exe"
+    } else {
+        "ha-auth"
+    });
     let current_auth_sha = project_manifest
         .as_ref()
         .and_then(|m| m.auth.as_ref())
@@ -329,10 +340,7 @@ pub async fn status(
         .ok()
         .and_then(|(url, _)| auth_version_from_asset_url(url));
     match (current_auth_sha.as_deref(), latest_auth) {
-        (None, _) => println!(
-            "auth: unknown (missing local sha256; run `{}`)",
-            cmd_hint::run_cli("install auth")
-        ),
+        (None, _) => println!("auth: unknown"),
         (Some(_), Err(_)) => println!("auth: unknown (cannot check latest)"),
         (Some(current), Ok((_url, latest_sha))) => {
             if current.eq_ignore_ascii_case(&latest_sha) {
@@ -346,10 +354,9 @@ pub async fn status(
                 }
             } else {
                 println!(
-                    "auth: update available ({} -> {}; run `{}`)",
+                    "auth: update available ({} -> {})",
                     format_version_opt(current_auth_version.as_deref()),
-                    format_version_opt(latest_auth_version.as_deref()),
-                    cmd_hint::run_cli("update auth")
+                    format_version_opt(latest_auth_version.as_deref())
                 );
             }
         }
@@ -379,10 +386,7 @@ pub async fn status(
             println!("backend: no release yet")
         }
         (None, Ok(None)) => println!("backend: n/a (not configured)"),
-        (None, Ok(Some(_))) => println!(
-            "backend: not installed (run `{}`)",
-            cmd_hint::run_cli("install backend")
-        ),
+        (None, Ok(Some(_))) => println!("backend: not installed"),
         (Some(_), Ok(None)) if github_releases::has_backend_repo(&project.edition) => {
             println!("backend: installed, but no release available now")
         }
@@ -401,10 +405,9 @@ pub async fn status(
                 }
             } else {
                 println!(
-                    "backend: update available ({} -> {}; run `{}`)",
+                    "backend: update available ({} -> {})",
                     format_version_opt(current_backend_version.as_deref()),
-                    format_version_opt(latest_backend_version.as_deref()),
-                    cmd_hint::run_cli("update backend")
+                    format_version_opt(latest_backend_version.as_deref())
                 );
             }
         }
@@ -479,10 +482,7 @@ pub async fn status(
             Ok(Some(latest_bundle)) => {
                 if instances.is_empty() {
                     if untracked_instances.is_empty() {
-                        println!(
-                            "wrapper/{wrapper_id}: not installed (run `{}`)",
-                            cmd_hint::run_cli(&format!("install wrapper {wrapper_id}"))
-                        );
+                        println!("wrapper/{wrapper_id}: not installed");
                     }
                     continue;
                 }
@@ -505,10 +505,9 @@ pub async fn status(
                         }
                     } else {
                         println!(
-                            "wrapper/{instance_id}: update available ({} -> {}; run `{}`)",
+                            "wrapper/{instance_id}: update available ({} -> {})",
                             format_version_opt(current_wrapper_version.as_deref()),
-                            format_version_opt(latest_wrapper_version.as_deref()),
-                            cmd_hint::run_cli(&format!("update wrapper {instance_id}"))
+                            format_version_opt(latest_wrapper_version.as_deref())
                         );
                     }
                 }
@@ -544,10 +543,7 @@ pub async fn status(
                 )
             });
         match latest {
-            Err(_) => println!(
-                "wrapper/{wrapper_id}: experimental, installed (cannot check latest; not supported for official submission in edition {})",
-                project.edition
-            ),
+            Err(_) => println!("wrapper/{wrapper_id}: experimental, unknown (cannot check latest)"),
             Ok(None) => println!(
                 "wrapper/{wrapper_id}: experimental, installed but no release available now"
             ),
@@ -568,10 +564,9 @@ pub async fn status(
                     }
                 } else {
                     println!(
-                        "wrapper/{wrapper_id}: experimental, update available ({} -> {}; run `{}`)",
+                        "wrapper/{wrapper_id}: experimental, update available ({} -> {})",
                         format_version_opt(current_wrapper_version.as_deref()),
-                        format_version_opt(latest_wrapper_version.as_deref()),
-                        cmd_hint::run_cli(&format!("update wrapper {wrapper_id}"))
+                        format_version_opt(latest_wrapper_version.as_deref())
                     );
                 }
             }
@@ -599,30 +594,26 @@ fn print_untracked_wrapper_status(entry: &WrapperDiskEntry) {
     };
     match entry.layout_issue.as_deref() {
         Some(issue) => {
-            if entry.known_for_edition {
-                println!(
-                    "wrapper/{}: {}invalid layout on disk, not tracked in manifest: {}",
-                    entry.id, experimental_prefix, issue
-                );
+            let suffix = if entry.known_for_edition {
+                ""
             } else {
-                println!(
-                    "wrapper/{}: {}invalid layout on disk, not tracked in manifest: {}; not configured for this edition",
-                    entry.id, experimental_prefix, issue
-                );
-            }
+                "; not configured for this edition"
+            };
+            println!(
+                "wrapper/{}: {}invalid layout on disk, not tracked in manifest: {}{}",
+                entry.id, experimental_prefix, issue, suffix
+            );
         }
         None => {
-            if entry.known_for_edition {
-                println!(
-                    "wrapper/{}: {}installed on disk, not tracked in manifest",
-                    entry.id, experimental_prefix
-                );
+            let suffix = if entry.known_for_edition {
+                ""
             } else {
-                println!(
-                    "wrapper/{}: {}installed on disk, not tracked in manifest; not configured for this edition",
-                    entry.id, experimental_prefix
-                );
-            }
+                "; not configured for this edition"
+            };
+            println!(
+                "wrapper/{}: {}installed on disk, not tracked in manifest{}",
+                entry.id, experimental_prefix, suffix
+            );
         }
     }
 }
@@ -658,10 +649,10 @@ fn print_github_auth_status(paths: &Paths) -> Result<(), HackArenaError> {
         }
         None => {
             println!("GitHub auth: none");
-            println!(
-                "Note: anonymous GitHub API rate limits may apply. Run `{}` or set GH_TOKEN/GITHUB_TOKEN.",
+            print_action(&format!(
+                "run `{}` or set GH_TOKEN/GITHUB_TOKEN to avoid anonymous rate limits",
                 cmd_hint::run_cli("github login")
-            );
+            ));
         }
     }
     Ok(())
