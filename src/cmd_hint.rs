@@ -1,19 +1,21 @@
-use std::path::Path;
-
 pub fn run_cli(args: &str) -> String {
-    let name = detect_cli_binary_name();
-    format_run_cli_for_binary(&name, args, cfg!(windows))
+    let invocation = detect_cli_invocation();
+    format_run_cli_for_binary(&invocation, args, cfg!(windows))
 }
 
-fn format_run_cli_for_binary(name: &str, args: &str, windows: bool) -> String {
+fn format_run_cli_for_binary(invocation: &str, args: &str, windows: bool) -> String {
     let bin = if windows {
-        if name.eq_ignore_ascii_case("hackarena.exe") {
+        if invocation.eq_ignore_ascii_case("hackarena.exe") {
             "hackarena.exe".to_string()
+        } else if contains_path_separator(invocation) {
+            invocation.replace('/', "\\")
         } else {
-            format!(".\\{name}")
+            format!(".\\{invocation}")
         }
+    } else if contains_path_separator(invocation) {
+        invocation.to_string()
     } else {
-        format!("./{name}")
+        format!("./{invocation}")
     };
     if args.trim().is_empty() {
         maybe_quote(&bin)
@@ -22,24 +24,34 @@ fn format_run_cli_for_binary(name: &str, args: &str, windows: bool) -> String {
     }
 }
 
-fn detect_cli_binary_name() -> String {
+fn detect_cli_invocation() -> String {
+    if let Some(arg0) = std::env::args_os()
+        .next()
+        .and_then(|value| value.into_string().ok())
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+    {
+        return arg0;
+    }
+
     if let Ok(path) = std::env::current_exe()
         && let Some(name) = path.file_name().and_then(|s| s.to_str())
     {
         let trimmed = name.trim();
         if !trimmed.is_empty() {
-            return Path::new(trimmed)
-                .file_name()
-                .and_then(|s| s.to_str())
-                .unwrap_or(trimmed)
-                .to_string();
+            return trimmed.to_string();
         }
     }
+
     if cfg!(windows) {
         "hackarena.exe".to_string()
     } else {
         "hackarena".to_string()
     }
+}
+
+fn contains_path_separator(value: &str) -> bool {
+    value.contains('\\') || value.contains('/')
 }
 
 fn maybe_quote(value: &str) -> String {
@@ -68,6 +80,18 @@ mod tests {
     fn formats_custom_binary_hint() {
         let out = format_run_cli_for_binary("hackarena-cli-v0.1.0-beta.1.exe", "install", true);
         assert_eq!(out, ".\\hackarena-cli-v0.1.0-beta.1.exe install");
+    }
+
+    #[test]
+    fn preserves_explicit_relative_windows_invocation() {
+        let out = format_run_cli_for_binary(".\\hackarena.exe", "status", true);
+        assert_eq!(out, ".\\hackarena.exe status");
+    }
+
+    #[test]
+    fn preserves_explicit_relative_unix_invocation() {
+        let out = format_run_cli_for_binary("./hackarena", "status", false);
+        assert_eq!(out, "./hackarena status");
     }
 
     #[test]
