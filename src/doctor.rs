@@ -1,7 +1,7 @@
 use crate::cmd_hint;
 use crate::config::{
-    Paths, ProjectContext, load_project_config, load_project_manifest, project_config_path,
-    project_manifest_path, resolve_project_context, validate_edition,
+    Paths, ProjectContext, available_editions_pretty, load_project_config, load_project_manifest,
+    project_config_path, project_manifest_path, resolve_project_context, validate_edition,
 };
 use crate::constants::{PROJECT_STANDALONE_DIR, PROJECT_WRAPPERS_DIR};
 use crate::download::sha256_file_hex;
@@ -43,7 +43,7 @@ pub async fn doctor(
 ) -> Result<(), HackArenaError> {
     let cwd = std::env::current_dir().map_err(HackArenaError::Io)?;
     print_header("hackarena doctor");
-    let Some((ctx, project)) = load_project_or_warn(&cwd, "install")? else {
+    let Some((ctx, project)) = load_project_or_warn(&cwd)? else {
         return Ok(());
     };
     let workspace_root = &ctx.workspace_root;
@@ -151,7 +151,6 @@ fn print_header(title: &str) {
 
 fn load_project_or_warn(
     cwd: &Path,
-    install_hint: &str,
 ) -> Result<Option<(ProjectContext, crate::config::ProjectConfig)>, HackArenaError> {
     let Some(ctx) = resolve_project_context(cwd)? else {
         println!();
@@ -160,9 +159,10 @@ fn load_project_or_warn(
             "not initialized (missing `./.hackarena/project.json`)",
             &project_config_path(cwd),
         );
+        let editions = available_editions_pretty()?;
         println!(
-            "Run `{}` in this directory.",
-            cmd_hint::run_cli(install_hint)
+            "Run `{}` in this directory. Available editions: {editions}.",
+            cmd_hint::run_cli("use <edition>")
         );
         return Ok(None);
     };
@@ -344,7 +344,7 @@ pub async fn status(
 ) -> Result<(), HackArenaError> {
     let cwd = std::env::current_dir().map_err(HackArenaError::Io)?;
     print_header("hackarena status");
-    let Some((ctx, project)) = load_project_or_warn(&cwd, "install")? else {
+    let Some((ctx, project)) = load_project_or_warn(&cwd)? else {
         return Ok(());
     };
     let workspace_root = &ctx.workspace_root;

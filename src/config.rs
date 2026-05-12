@@ -8,7 +8,7 @@ mod workspace;
 mod workspace_migrations;
 
 pub use edition_config::{ArtifactSpec, BackendConfig, BackendSource, EditionConfig, WrapperSpec};
-pub use editions::validate_edition;
+pub use editions::{available_editions_pretty, validate_edition};
 pub use fs::ensure_dir;
 pub use paths::Paths;
 pub use project::{
