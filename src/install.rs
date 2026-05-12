@@ -2,8 +2,8 @@ use crate::archive::{ensure_executable, extract_archive, recreate_dir};
 use crate::cmd_hint;
 use crate::config::{
     BackendConfig, BackendSource, EditionConfig, Paths, ProjectConfig, ProjectInstalledBinary,
-    ProjectInstalledBundle, ProjectManifest, ensure_dir, is_project_dir, load_project_config,
-    load_project_manifest, project_meta_dir, save_project_config, save_project_manifest,
+    ProjectInstalledBundle, ProjectManifest, ensure_dir, ensure_workspace_for_edition,
+    load_project_config, load_project_manifest, resolve_project_context, save_project_manifest,
     validate_edition,
 };
 use crate::constants::{PROJECT_BACKEND_DIR, PROJECT_STANDALONE_DIR, PROJECT_WRAPPERS_DIR};
@@ -19,23 +19,19 @@ pub async fn use_edition(_paths: &Paths, edition: &str) -> Result<(), HackArenaE
     validate_edition(edition)?;
 
     let cwd = std::env::current_dir().map_err(HackArenaError::Io)?;
-    ensure_dir(&project_meta_dir(&cwd))?;
-
-    let mut cfg = if is_project_dir(&cwd) {
-        load_project_config(&cwd)?
-    } else {
-        ProjectConfig {
-            edition: edition.to_string(),
-            wrapper_id: None,
-            backend_dir: PathBuf::from(PROJECT_BACKEND_DIR),
-        }
-    };
-
-    cfg.edition = edition.to_string();
-    save_project_config(&cwd, &cfg)?;
+    ensure_workspace_for_edition(&cwd, edition)?;
 
     println!("Project edition set to `{edition}` (source: GitHub Releases).");
     Ok(())
+}
+
+fn require_project_context(cwd: &Path) -> Result<crate::config::ProjectContext, HackArenaError> {
+    resolve_project_context(cwd)?.ok_or_else(|| {
+        HackArenaError::msg(format!(
+            "No project found. Run `{}` first.",
+            cmd_hint::run_cli("use <edition>")
+        ))
+    })
 }
 
 /// Installs missing components using the current directory as a project.
@@ -48,20 +44,23 @@ pub async fn install(
     linux_libc: Option<LinuxLibcMode>,
 ) -> Result<(), HackArenaError> {
     let cwd = std::env::current_dir().map_err(HackArenaError::Io)?;
-    if !is_project_dir(&cwd) {
-        println!("No `./.hackarena/project.json` found in {}.", cwd.display());
-        println!("Run `{}` first.", cmd_hint::run_cli("use <edition>"));
-        return Ok(());
-    }
-
-    let project = load_project_config(&cwd)?;
+    let ctx = match resolve_project_context(&cwd)? {
+        Some(ctx) => ctx,
+        None => {
+            println!("No project found in {}.", cwd.display());
+            println!("Run `{}` first.", cmd_hint::run_cli("use <edition>"));
+            return Ok(());
+        }
+    };
+    let workspace_root = &ctx.workspace_root;
+    let project = load_project_config(workspace_root)?;
     validate_edition(&project.edition)?;
-    let backend_dir = cwd.join(&project.backend_dir);
-    let mut manifest = load_project_manifest(&cwd)?;
+    let backend_dir = workspace_root.join(&project.backend_dir);
+    let mut manifest = load_project_manifest(workspace_root)?;
 
     let config = load_effective_config(paths, &project, no_cache, prerelease, linux_libc).await?;
-    let installed_wrappers = discover_installed_wrappers(&cwd);
-    let wrappers_root = cwd.join(PROJECT_WRAPPERS_DIR);
+    let installed_wrappers = discover_installed_wrappers(workspace_root);
+    let wrappers_root = workspace_root.join(PROJECT_WRAPPERS_DIR);
     let project_wrapper_requires_experimental =
         project.wrapper_id.as_deref().is_some_and(|wrapper_id| {
             github_releases::is_experimental_wrapper(&project.edition, wrapper_id)
@@ -212,7 +211,7 @@ pub async fn install(
             },
         );
     }
-    save_project_manifest(&cwd, &manifest)?;
+    save_project_manifest(workspace_root, &manifest)?;
 
     Ok(())
 }
@@ -227,8 +226,9 @@ pub async fn update(
     update_auth(paths, no_cache, prerelease, linux_libc).await?;
     update_backend(paths, no_cache, prerelease, linux_libc).await?;
     let cwd = std::env::current_dir().map_err(HackArenaError::Io)?;
-    let project = load_project_config(&cwd)?;
-    let manifest = load_project_manifest(&cwd).unwrap_or_default();
+    let ctx = require_project_context(&cwd)?;
+    let project = load_project_config(&ctx.workspace_root)?;
+    let manifest = load_project_manifest(&ctx.workspace_root).unwrap_or_default();
     let wrapper_ids = manifest.wrappers.keys().cloned().collect::<Vec<_>>();
     for wrapper_id in wrapper_ids {
         if !github_releases::has_wrapper_repo(&project.edition, &wrapper_id) {
@@ -248,14 +248,8 @@ pub async fn update_auth(
     linux_libc: Option<LinuxLibcMode>,
 ) -> Result<(), HackArenaError> {
     let cwd = std::env::current_dir().map_err(HackArenaError::Io)?;
-    if !is_project_dir(&cwd) {
-        return Err(HackArenaError::msg(format!(
-            "No `./.hackarena/project.json` found. Run `{}` first.",
-            cmd_hint::run_cli("install")
-        )));
-    }
-
-    let project = load_project_config(&cwd)?;
+    let ctx = require_project_context(&cwd)?;
+    let project = load_project_config(&ctx.workspace_root)?;
     validate_edition(&project.edition)?;
     let config = load_effective_config(paths, &project, no_cache, prerelease, linux_libc).await?;
 
@@ -315,18 +309,13 @@ pub async fn update_backend(
     linux_libc: Option<LinuxLibcMode>,
 ) -> Result<(), HackArenaError> {
     let cwd = std::env::current_dir().map_err(HackArenaError::Io)?;
-    if !is_project_dir(&cwd) {
-        return Err(HackArenaError::msg(format!(
-            "No `./.hackarena/project.json` found. Run `{}` first.",
-            cmd_hint::run_cli("install")
-        )));
-    }
-
-    let project = load_project_config(&cwd)?;
+    let ctx = require_project_context(&cwd)?;
+    let workspace_root = &ctx.workspace_root;
+    let project = load_project_config(workspace_root)?;
     validate_edition(&project.edition)?;
     let mut config =
         load_effective_config(paths, &project, no_cache, prerelease, linux_libc).await?;
-    let current_project_manifest = load_project_manifest(&cwd).unwrap_or_default();
+    let current_project_manifest = load_project_manifest(workspace_root).unwrap_or_default();
     let current_backend_version = current_project_manifest
         .backend
         .as_ref()
@@ -374,7 +363,7 @@ pub async fn update_backend(
         }
     }
 
-    let backend_dir = cwd.join(&project.backend_dir);
+    let backend_dir = workspace_root.join(&project.backend_dir);
     if let Err(err) = install_backend_to_dir(paths, &config, &backend_dir, true).await {
         if matches!(err, HackArenaError::ChecksumMismatch { .. }) {
             config = load_effective_config(paths, &project, true, prerelease, linux_libc).await?;
@@ -384,9 +373,9 @@ pub async fn update_backend(
         }
     }
 
-    let mut manifest = load_project_manifest(&cwd)?;
+    let mut manifest = load_project_manifest(workspace_root)?;
     manifest.backend = latest_backend;
-    save_project_manifest(&cwd, &manifest)?;
+    save_project_manifest(workspace_root, &manifest)?;
 
     Ok(())
 }
@@ -399,13 +388,8 @@ pub async fn install_auth(
     linux_libc: Option<LinuxLibcMode>,
 ) -> Result<(), HackArenaError> {
     let cwd = std::env::current_dir().map_err(HackArenaError::Io)?;
-    if !is_project_dir(&cwd) {
-        return Err(HackArenaError::msg(format!(
-            "No project found. Run `{}` in your project first.",
-            cmd_hint::run_cli("use <edition>")
-        )));
-    }
-    let project = load_project_config(&cwd)?;
+    let ctx = require_project_context(&cwd)?;
+    let project = load_project_config(&ctx.workspace_root)?;
     let config = load_effective_config(paths, &project, no_cache, prerelease, linux_libc).await?;
     install_auth_with_config(paths, &config).await?;
     print_path_hint(paths);
@@ -420,14 +404,9 @@ pub async fn install_backend(
     linux_libc: Option<LinuxLibcMode>,
 ) -> Result<(), HackArenaError> {
     let cwd = std::env::current_dir().map_err(HackArenaError::Io)?;
-    let project = if is_project_dir(&cwd) {
-        load_project_config(&cwd)?
-    } else {
-        return Err(HackArenaError::msg(format!(
-            "No project found. Run `{}` first.",
-            cmd_hint::run_cli("use <edition>")
-        )));
-    };
+    let ctx = require_project_context(&cwd)?;
+    let workspace_root = &ctx.workspace_root;
+    let project = load_project_config(workspace_root)?;
 
     let config = load_effective_config(paths, &project, no_cache, prerelease, linux_libc).await?;
     if config.backend.is_none() {
@@ -436,8 +415,8 @@ pub async fn install_backend(
             project.edition
         )));
     }
-    let mut manifest = load_project_manifest(&cwd)?;
-    let backend_dir = cwd.join(&project.backend_dir);
+    let mut manifest = load_project_manifest(workspace_root)?;
+    let backend_dir = workspace_root.join(&project.backend_dir);
     if backend_dir.exists() {
         if backend_dir_needs_repair(&manifest, &project.backend_dir, &backend_dir)? {
             println!(
@@ -446,7 +425,7 @@ pub async fn install_backend(
             );
             install_backend_to_dir(paths, &config, &backend_dir, true).await?;
             manifest.backend = resolve_project_backend_manifest(&config).await?;
-            save_project_manifest(&cwd, &manifest)?;
+            save_project_manifest(workspace_root, &manifest)?;
             return Ok(());
         }
         println!("Backend already exists at {}", backend_dir.display());
@@ -454,7 +433,7 @@ pub async fn install_backend(
     }
     install_backend_to_dir(paths, &config, &backend_dir, false).await?;
     manifest.backend = resolve_project_backend_manifest(&config).await?;
-    save_project_manifest(&cwd, &manifest)?;
+    save_project_manifest(workspace_root, &manifest)?;
     Ok(())
 }
 
@@ -466,14 +445,9 @@ pub async fn install_standalone(
     linux_libc: Option<LinuxLibcMode>,
 ) -> Result<(), HackArenaError> {
     let cwd = std::env::current_dir().map_err(HackArenaError::Io)?;
-    let project = if is_project_dir(&cwd) {
-        load_project_config(&cwd)?
-    } else {
-        return Err(HackArenaError::msg(format!(
-            "No project found. Run `{}` first.",
-            cmd_hint::run_cli("use <edition>")
-        )));
-    };
+    let ctx = require_project_context(&cwd)?;
+    let workspace_root = &ctx.workspace_root;
+    let project = load_project_config(workspace_root)?;
     validate_edition(&project.edition)?;
 
     let Some(latest_standalone) = github_releases::latest_standalone_from_releases(
@@ -492,8 +466,8 @@ pub async fn install_standalone(
         )));
     };
 
-    let mut manifest = load_project_manifest(&cwd)?;
-    let standalone_dir = cwd.join(PROJECT_STANDALONE_DIR);
+    let mut manifest = load_project_manifest(workspace_root)?;
+    let standalone_dir = workspace_root.join(PROJECT_STANDALONE_DIR);
     if standalone_dir.exists() {
         if standalone_dir_needs_repair(&manifest, &standalone_dir)? {
             println!(
@@ -514,7 +488,7 @@ pub async fn install_standalone(
                 PROJECT_STANDALONE_DIR,
                 latest_standalone.sha256.clone(),
             ));
-            save_project_manifest(&cwd, &manifest)?;
+            save_project_manifest(workspace_root, &manifest)?;
             return Ok(());
         }
         println!("Standalone already exists at {}", standalone_dir.display());
@@ -535,7 +509,7 @@ pub async fn install_standalone(
         PROJECT_STANDALONE_DIR,
         latest_standalone.sha256.clone(),
     ));
-    save_project_manifest(&cwd, &manifest)?;
+    save_project_manifest(workspace_root, &manifest)?;
     Ok(())
 }
 
@@ -550,14 +524,9 @@ pub async fn install_wrapper(
     linux_libc: Option<LinuxLibcMode>,
 ) -> Result<(), HackArenaError> {
     let cwd = std::env::current_dir().map_err(HackArenaError::Io)?;
-    let project = if is_project_dir(&cwd) {
-        load_project_config(&cwd)?
-    } else {
-        return Err(HackArenaError::msg(format!(
-            "No project found. Run `{}` first.",
-            cmd_hint::run_cli("use <edition>")
-        )));
-    };
+    let ctx = require_project_context(&cwd)?;
+    let workspace_root = &ctx.workspace_root;
+    let project = load_project_config(workspace_root)?;
 
     let config = load_effective_config(paths, &project, no_cache, prerelease, linux_libc).await?;
     let requested_wrapper_id = match wrapper_id {
@@ -565,7 +534,7 @@ pub async fn install_wrapper(
         None => choose_wrapper_for_install_command(&project.edition, &config, experimental)?,
     };
 
-    let wrappers_root = cwd.join(PROJECT_WRAPPERS_DIR);
+    let wrappers_root = workspace_root.join(PROJECT_WRAPPERS_DIR);
     ensure_dir(&wrappers_root)?;
     let managed_wrapper_id = github_releases::wrapper_base_id(&requested_wrapper_id).to_string();
     ensure_wrapper_install_allowed(
@@ -639,7 +608,7 @@ pub async fn install_wrapper(
     )
     .await?;
 
-    let mut manifest = load_project_manifest(&cwd)?;
+    let mut manifest = load_project_manifest(workspace_root)?;
     manifest.wrappers.insert(
         target_wrapper_id.clone(),
         ProjectInstalledBundle {
@@ -650,7 +619,7 @@ pub async fn install_wrapper(
             files: vec![],
         },
     );
-    save_project_manifest(&cwd, &manifest)?;
+    save_project_manifest(workspace_root, &manifest)?;
     Ok(())
 }
 
@@ -661,17 +630,12 @@ pub async fn update_standalone(
     linux_libc: Option<LinuxLibcMode>,
 ) -> Result<(), HackArenaError> {
     let cwd = std::env::current_dir().map_err(HackArenaError::Io)?;
-    if !is_project_dir(&cwd) {
-        return Err(HackArenaError::msg(format!(
-            "No `./.hackarena/project.json` found. Run `{}` first.",
-            cmd_hint::run_cli("install")
-        )));
-    }
-
-    let project = load_project_config(&cwd)?;
+    let ctx = require_project_context(&cwd)?;
+    let workspace_root = &ctx.workspace_root;
+    let project = load_project_config(workspace_root)?;
     validate_edition(&project.edition)?;
-    let mut manifest = load_project_manifest(&cwd)?;
-    let standalone_dir = cwd.join(PROJECT_STANDALONE_DIR);
+    let mut manifest = load_project_manifest(workspace_root)?;
+    let standalone_dir = workspace_root.join(PROJECT_STANDALONE_DIR);
     let current_standalone = manifest.standalone.as_ref();
     let current_version = current_standalone
         .and_then(|bundle| github_releases::standalone_version_from_asset_url(&bundle.url));
@@ -729,7 +693,7 @@ pub async fn update_standalone(
         PROJECT_STANDALONE_DIR,
         latest_standalone.sha256.clone(),
     ));
-    save_project_manifest(&cwd, &manifest)?;
+    save_project_manifest(workspace_root, &manifest)?;
     Ok(())
 }
 
@@ -742,16 +706,12 @@ pub async fn update_wrapper(
     linux_libc: Option<LinuxLibcMode>,
 ) -> Result<(), HackArenaError> {
     let cwd = std::env::current_dir().map_err(HackArenaError::Io)?;
-    if !is_project_dir(&cwd) {
-        return Err(HackArenaError::msg(format!(
-            "No `./.hackarena/project.json` found. Run `{}` first.",
-            cmd_hint::run_cli("install")
-        )));
-    }
-    let project = load_project_config(&cwd)?;
+    let ctx = require_project_context(&cwd)?;
+    let workspace_root = &ctx.workspace_root;
+    let project = load_project_config(workspace_root)?;
     validate_edition(&project.edition)?;
 
-    let wrapper_dir = cwd.join(PROJECT_WRAPPERS_DIR).join(wrapper_id);
+    let wrapper_dir = workspace_root.join(PROJECT_WRAPPERS_DIR).join(wrapper_id);
     if !wrapper_dir.exists() {
         return Err(HackArenaError::msg(format!(
             "Wrapper `{wrapper_id}` is not installed in {}. Run `{}` first.",
@@ -761,7 +721,7 @@ pub async fn update_wrapper(
     }
 
     let managed_wrapper_id = github_releases::wrapper_base_id(wrapper_id).to_string();
-    let current_wrapper_version = load_project_manifest(&cwd)
+    let current_wrapper_version = load_project_manifest(workspace_root)
         .ok()
         .and_then(|manifest| manifest.wrappers.get(wrapper_id).cloned())
         .and_then(|bundle| {
@@ -779,7 +739,7 @@ pub async fn update_wrapper(
     )
     .await?;
 
-    let mut manifest = load_project_manifest(&cwd)?;
+    let mut manifest = load_project_manifest(workspace_root)?;
     if let Some(current) = manifest.wrappers.get(wrapper_id) {
         if current.sha256.as_deref() == Some(wrapper_sha.as_str()) && current.url == wrapper_url {
             println!("Wrapper `{wrapper_id}` is already up to date.");
@@ -813,7 +773,7 @@ pub async fn update_wrapper(
             files: vec![],
         },
     );
-    save_project_manifest(&cwd, &manifest)?;
+    save_project_manifest(workspace_root, &manifest)?;
     Ok(())
 }
 

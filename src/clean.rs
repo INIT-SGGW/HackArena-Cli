@@ -1,6 +1,6 @@
 use crate::config::{
-    Paths, is_project_dir, load_project_manifest, project_config_path, project_manifest_path,
-    project_meta_dir,
+    Paths, load_project_manifest, project_config_path, project_manifest_path, project_meta_dir,
+    resolve_project_context,
 };
 use crate::error::HackArenaError;
 use std::fs;
@@ -20,16 +20,22 @@ pub async fn clean(
 
     let selected_project = all || project || (!project && !global);
     let selected_global = all || global || (!project && !global);
+    let project_ctx = if selected_project {
+        resolve_project_context(&cwd)?
+    } else {
+        None
+    };
 
     let mut items: Vec<CleanItem> = Vec::new();
 
     // Project-local
-    if selected_project && is_project_dir(&cwd) {
-        if let Ok(m) = load_project_manifest(&cwd) {
+    if selected_project && let Some(ctx) = project_ctx.clone() {
+        let workspace_root = ctx.workspace_root;
+        if let Ok(m) = load_project_manifest(&workspace_root) {
             if let Some(backend) = m.backend.as_ref() {
                 items.push(CleanItem::dir(
                     "project backend",
-                    cwd.join(&backend.install_dir),
+                    workspace_root.join(&backend.install_dir),
                     backend.installed_at_unix,
                 ));
             }
@@ -37,7 +43,7 @@ pub async fn clean(
             if let Some(standalone) = m.standalone.as_ref() {
                 items.push(CleanItem::dir(
                     "project standalone",
-                    cwd.join(&standalone.install_dir),
+                    workspace_root.join(&standalone.install_dir),
                     standalone.installed_at_unix,
                 ));
             }
@@ -45,7 +51,7 @@ pub async fn clean(
             for (wrapper_id, wrapper) in &m.wrappers {
                 items.push(CleanItem::dir(
                     &format!("project wrapper `{wrapper_id}`"),
-                    cwd.join(&wrapper.install_dir),
+                    workspace_root.join(&wrapper.install_dir),
                     wrapper.installed_at_unix,
                 ));
             }
@@ -53,13 +59,13 @@ pub async fn clean(
 
         items.push(CleanItem::dir(
             "project meta dir",
-            project_meta_dir(&cwd),
+            project_meta_dir(&workspace_root),
             None,
         ));
-        let manifest_path = project_manifest_path(&cwd);
+        let manifest_path = project_manifest_path(&workspace_root);
         items.push(CleanItem::file("project manifest", manifest_path, None));
 
-        let project_path = project_config_path(&cwd);
+        let project_path = project_config_path(&workspace_root);
         items.push(CleanItem::file("project config", project_path, None));
     }
 
@@ -199,8 +205,8 @@ pub async fn clean(
     }
 
     // Finally, offer to remove now-empty roots (only if we didn't keep something inside).
-    if selected_project {
-        let meta = project_meta_dir(&cwd);
+    if selected_project && let Some(ctx) = project_ctx {
+        let meta = project_meta_dir(&ctx.workspace_root);
         if meta.exists() && is_dir_empty(&meta)? && !declined.iter().any(|p| p.starts_with(&meta)) {
             if let Err(err) = maybe_delete_empty_dir("project meta dir", &meta, force) {
                 print_clean_error("project meta dir", &meta, &err);

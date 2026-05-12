@@ -28,11 +28,6 @@ pub fn project_manifest_path(project_root: &Path) -> PathBuf {
     project_meta_dir(project_root).join(PROJECT_MANIFEST_FILE)
 }
 
-/// Returns true if the current directory looks like a HackArena project.
-pub fn is_project_dir(project_root: &Path) -> bool {
-    project_config_path(project_root).exists()
-}
-
 /// Loads `./.hackarena/project.json`.
 pub fn load_project_config(project_root: &Path) -> Result<ProjectConfig, HackArenaError> {
     let path = project_config_path(project_root);

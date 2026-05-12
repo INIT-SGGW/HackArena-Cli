@@ -5,6 +5,12 @@
 /// Project metadata directory name.
 pub const PROJECT_META_DIR: &str = ".hackarena";
 
+/// Root-level file describing multi-edition workspace state.
+pub const PROJECT_WORKSPACE_FILE: &str = "workspace.json";
+
+/// Project-local editions container directory.
+pub const PROJECT_EDITIONS_DIR: &str = "editions";
+
 /// Project config file name inside `.hackarena/`.
 pub const PROJECT_CONFIG_FILE: &str = "project.json";
 

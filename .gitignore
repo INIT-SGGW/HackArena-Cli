@@ -25,4 +25,5 @@ target
 /backend/
 /wrappers/
 /standalone/
+/editions/
 /deploy/

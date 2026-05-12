@@ -1,6 +1,6 @@
 use crate::auth_cmd::resolve_auth_binary;
 use crate::cmd_hint;
-use crate::config::{Paths, is_project_dir, load_project_config};
+use crate::config::{Paths, load_project_config, resolve_project_context};
 use crate::constants::PROJECT_WRAPPERS_DIR;
 use crate::error::HackArenaError;
 use crate::submission_proto::submission_v1::{
@@ -29,16 +29,16 @@ pub async fn submit(
     description: Option<&str>,
 ) -> Result<(), HackArenaError> {
     let cwd = std::env::current_dir().map_err(HackArenaError::Io)?;
-    if !is_project_dir(&cwd) {
+    let Some(ctx) = resolve_project_context(&cwd)? else {
         return Err(HackArenaError::msg(format!(
             "No project found. Run `{}` first.",
             cmd_hint::run_cli("use <edition>")
         )));
-    }
-    let project = load_project_config(&cwd)?;
+    };
+    let project = load_project_config(&ctx.workspace_root)?;
     let slot = resolve_submit_slot(&project.edition, slot)?;
 
-    let wrappers_root = cwd.join(PROJECT_WRAPPERS_DIR);
+    let wrappers_root = ctx.workspace_root.join(PROJECT_WRAPPERS_DIR);
     let wrappers = discover_wrappers(&wrappers_root)?;
     if wrappers.is_empty() {
         return Err(HackArenaError::msg(format!(

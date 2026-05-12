@@ -1,7 +1,7 @@
 use crate::cmd_hint;
 use crate::config::{
-    Paths, is_project_dir, load_project_config, load_project_manifest, project_config_path,
-    project_manifest_path, validate_edition,
+    Paths, ProjectContext, load_project_config, load_project_manifest, project_config_path,
+    project_manifest_path, resolve_project_context, validate_edition,
 };
 use crate::constants::{PROJECT_STANDALONE_DIR, PROJECT_WRAPPERS_DIR};
 use crate::download::sha256_file_hex;
@@ -41,33 +41,35 @@ pub async fn doctor(
 ) -> Result<(), HackArenaError> {
     let cwd = std::env::current_dir().map_err(HackArenaError::Io)?;
     print_header("hackarena doctor");
-    let Some(project) = load_project_or_warn(&cwd, "install")? else {
+    let Some((ctx, project)) = load_project_or_warn(&cwd, "install")? else {
         return Ok(());
     };
+    let workspace_root = &ctx.workspace_root;
     let auth_path = paths.bin_dir.join(if cfg!(windows) {
         "ha-auth.exe"
     } else {
         "ha-auth"
     });
-    let backend_dir = cwd.join(&project.backend_dir);
-    let standalone_dir = cwd.join(PROJECT_STANDALONE_DIR);
-    let manifest = load_project_manifest(&cwd).unwrap_or_default();
-    let wrapper_disk_entries = discover_wrapper_disk_entries(&cwd, &project.edition, &manifest);
+    let backend_dir = workspace_root.join(&project.backend_dir);
+    let standalone_dir = workspace_root.join(PROJECT_STANDALONE_DIR);
+    let manifest = load_project_manifest(workspace_root).unwrap_or_default();
+    let wrapper_disk_entries =
+        discover_wrapper_disk_entries(workspace_root, &project.edition, &manifest);
 
-    println!("Project dir: {}", cwd.display());
+    println!("Project dir: {}", workspace_root.display());
     println!("Edition: {}", project.edition);
     println!();
 
     println!("Project");
     print_check(
         "project.json",
-        project_config_path(&cwd).exists(),
-        &project_config_path(&cwd),
+        project_config_path(workspace_root).exists(),
+        &project_config_path(workspace_root),
     );
     print_check(
         "manifest.json",
-        project_manifest_path(&cwd).exists(),
-        &project_manifest_path(&cwd),
+        project_manifest_path(workspace_root).exists(),
+        &project_manifest_path(workspace_root),
     );
     print_check_value(
         "edition",
@@ -100,8 +102,8 @@ pub async fn doctor(
     print_standalone_doctor_status(&manifest, &standalone_dir);
     print_check_with_action(
         "wrappers/",
-        cwd.join("wrappers").exists(),
-        &cwd.join("wrappers"),
+        workspace_root.join("wrappers").exists(),
+        &workspace_root.join("wrappers"),
         Some(cmd_hint::run_cli("install wrapper")),
     );
     println!();
@@ -140,8 +142,8 @@ fn print_header(title: &str) {
 fn load_project_or_warn(
     cwd: &Path,
     install_hint: &str,
-) -> Result<Option<crate::config::ProjectConfig>, HackArenaError> {
-    if !is_project_dir(cwd) {
+) -> Result<Option<(ProjectContext, crate::config::ProjectConfig)>, HackArenaError> {
+    let Some(ctx) = resolve_project_context(cwd)? else {
         println!();
         print_warn(
             "Project",
@@ -153,8 +155,9 @@ fn load_project_or_warn(
             cmd_hint::run_cli(install_hint)
         );
         return Ok(None);
-    }
-    Ok(Some(load_project_config(cwd)?))
+    };
+    let project = load_project_config(&ctx.workspace_root)?;
+    Ok(Some((ctx, project)))
 }
 
 fn print_check(label: &str, ok: bool, path: &Path) {
@@ -331,32 +334,33 @@ pub async fn status(
 ) -> Result<(), HackArenaError> {
     let cwd = std::env::current_dir().map_err(HackArenaError::Io)?;
     print_header("hackarena status");
-    let Some(project) = load_project_or_warn(&cwd, "install")? else {
+    let Some((ctx, project)) = load_project_or_warn(&cwd, "install")? else {
         return Ok(());
     };
+    let workspace_root = &ctx.workspace_root;
 
     println!("Edition: {}", project.edition);
     println!();
 
-    let project_manifest = load_project_manifest(&cwd).ok();
+    let project_manifest = load_project_manifest(workspace_root).ok();
     let wrapper_disk_entries = project_manifest
         .as_ref()
-        .map(|manifest| discover_wrapper_disk_entries(&cwd, &project.edition, manifest))
+        .map(|manifest| discover_wrapper_disk_entries(workspace_root, &project.edition, manifest))
         .unwrap_or_else(|| {
             discover_wrapper_disk_entries(
-                &cwd,
+                workspace_root,
                 &project.edition,
                 &crate::config::ProjectManifest::default(),
             )
         });
 
     if verbose {
-        println!("Project dir: {}", cwd.display());
+        println!("Project dir: {}", workspace_root.display());
         print_verbose_runtime(paths, no_cache, prerelease);
         println!();
     }
 
-    let project_manifest = match load_project_manifest(&cwd) {
+    let project_manifest = match load_project_manifest(workspace_root) {
         Ok(m) => Some(m),
         Err(_) => None,
     };
@@ -462,7 +466,7 @@ pub async fn status(
     }
 
     // standalone (project-local, optional)
-    let standalone_dir = cwd.join(PROJECT_STANDALONE_DIR);
+    let standalone_dir = workspace_root.join(PROJECT_STANDALONE_DIR);
     let current_standalone = project_manifest
         .as_ref()
         .and_then(|m| m.standalone.as_ref());
