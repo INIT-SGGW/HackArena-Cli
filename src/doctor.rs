@@ -8,6 +8,7 @@ use crate::download::sha256_file_hex;
 use crate::error::HackArenaError;
 use crate::github_auth;
 use crate::github_releases;
+use crate::github_releases::ResolutionTrace;
 use crate::install::{
     discover_installed_wrappers, standalone_install_layout_issue, wrapper_install_layout_issue,
 };
@@ -404,6 +405,7 @@ pub async fn status(
         Ok(m) => Some(m),
         Err(_) => None,
     };
+    let mut resolution_lines = Vec::<String>::new();
 
     // auth (global)
     println!("Global");
@@ -419,15 +421,37 @@ pub async fn status(
         .map(|s| s.to_string())
         .or_else(|| sha256_file_hex(&auth_path).ok());
     let current_auth_version = current_auth_version_from_binary(&auth_path);
-    let latest_auth = github_releases::latest_auth_from_releases(
-        paths,
-        &project.edition,
-        no_cache,
-        prerelease,
-        current_auth_version.as_deref(),
-        None,
-    )
-    .await;
+    let (latest_auth, auth_trace) = if verbose {
+        match github_releases::latest_auth_from_releases_with_trace(
+            paths,
+            &project.edition,
+            no_cache,
+            prerelease,
+            current_auth_version.as_deref(),
+            None,
+        )
+        .await
+        {
+            Ok((value, trace)) => (Ok(value), Some(trace)),
+            Err(err) => (Err(err), None),
+        }
+    } else {
+        (
+            github_releases::latest_auth_from_releases(
+                paths,
+                &project.edition,
+                no_cache,
+                prerelease,
+                current_auth_version.as_deref(),
+                None,
+            )
+            .await,
+            None,
+        )
+    };
+    if let Some(trace) = auth_trace {
+        push_resolution_lines(&mut resolution_lines, "auth", trace);
+    }
     let latest_auth_version = latest_auth
         .as_ref()
         .ok()
@@ -469,15 +493,37 @@ pub async fn status(
     let current_backend = project_manifest.as_ref().and_then(|m| m.backend.as_ref());
     let current_backend_version =
         current_backend.and_then(|b| backend_version_from_asset_url(&b.url));
-    let latest_backend = github_releases::latest_backend_from_releases(
-        paths,
-        &project.edition,
-        no_cache,
-        prerelease,
-        current_backend_version.as_deref(),
-        None,
-    )
-    .await;
+    let (latest_backend, backend_trace) = if verbose {
+        match github_releases::latest_backend_from_releases_with_trace(
+            paths,
+            &project.edition,
+            no_cache,
+            prerelease,
+            current_backend_version.as_deref(),
+            None,
+        )
+        .await
+        {
+            Ok((value, trace)) => (Ok(value), Some(trace)),
+            Err(err) => (Err(err), None),
+        }
+    } else {
+        (
+            github_releases::latest_backend_from_releases(
+                paths,
+                &project.edition,
+                no_cache,
+                prerelease,
+                current_backend_version.as_deref(),
+                None,
+            )
+            .await,
+            None,
+        )
+    };
+    if let Some(trace) = backend_trace {
+        push_resolution_lines(&mut resolution_lines, "backend", trace);
+    }
     let latest_backend_version = latest_backend
         .as_ref()
         .ok()
@@ -559,15 +605,37 @@ pub async fn status(
     } else {
         let current_standalone_version =
             current_standalone.and_then(|bundle| standalone_version_from_asset_url(&bundle.url));
-        let latest_standalone = github_releases::latest_standalone_from_releases(
-            paths,
-            &project.edition,
-            no_cache,
-            prerelease,
-            current_standalone_version.as_deref(),
-            None,
-        )
-        .await;
+        let (latest_standalone, standalone_trace) = if verbose {
+            match github_releases::latest_standalone_from_releases_with_trace(
+                paths,
+                &project.edition,
+                no_cache,
+                prerelease,
+                current_standalone_version.as_deref(),
+                None,
+            )
+            .await
+            {
+                Ok((value, trace)) => (Ok(value), Some(trace)),
+                Err(err) => (Err(err), None),
+            }
+        } else {
+            (
+                github_releases::latest_standalone_from_releases(
+                    paths,
+                    &project.edition,
+                    no_cache,
+                    prerelease,
+                    current_standalone_version.as_deref(),
+                    None,
+                )
+                .await,
+                None,
+            )
+        };
+        if let Some(trace) = standalone_trace {
+            push_resolution_lines(&mut resolution_lines, "standalone", trace);
+        }
         let latest_standalone_version = latest_standalone
             .as_ref()
             .ok()
@@ -642,16 +710,47 @@ pub async fn status(
             .iter()
             .filter(|entry| github_releases::wrapper_base_id(&entry.id) == wrapper_id)
             .collect::<Vec<_>>();
-        let latest = github_releases::latest_wrapper_from_releases(
-            paths,
-            &project.edition,
-            wrapper_id,
-            no_cache,
-            prerelease,
-            None,
-            None,
-        )
-        .await;
+        let public_current_wrapper_version =
+            instances.first().and_then(|(_instance_id, current)| {
+                wrapper_version_from_asset_url(wrapper_id, &current.url)
+            });
+        let (latest, wrapper_trace) = if verbose {
+            match github_releases::latest_wrapper_from_releases_with_trace(
+                paths,
+                &project.edition,
+                wrapper_id,
+                no_cache,
+                prerelease,
+                public_current_wrapper_version.as_deref(),
+                None,
+            )
+            .await
+            {
+                Ok((value, trace)) => (Ok(value), Some(trace)),
+                Err(err) => (Err(err), None),
+            }
+        } else {
+            (
+                github_releases::latest_wrapper_from_releases(
+                    paths,
+                    &project.edition,
+                    wrapper_id,
+                    no_cache,
+                    prerelease,
+                    public_current_wrapper_version.as_deref(),
+                    None,
+                )
+                .await,
+                None,
+            )
+        };
+        if let Some(trace) = wrapper_trace {
+            push_resolution_lines(
+                &mut resolution_lines,
+                &format!("wrapper/{wrapper_id}"),
+                trace,
+            );
+        }
         let latest_wrapper_version = latest
             .as_ref()
             .ok()
@@ -809,6 +908,14 @@ pub async fn status(
         print_untracked_wrapper_status(entry);
     }
 
+    if verbose && !resolution_lines.is_empty() {
+        println!();
+        println!("Resolution");
+        for line in resolution_lines {
+            println!("{line}");
+        }
+    }
+
     Ok(())
 }
 
@@ -886,6 +993,62 @@ fn render_status_body(status: &str) -> String {
     } else {
         status.to_string()
     }
+}
+
+fn push_resolution_lines(lines: &mut Vec<String>, label: &str, trace: ResolutionTrace) {
+    if let Some(selected) = trace.selected_release_tag {
+        lines.push(format!("{label} selected release: {selected}"));
+    }
+
+    let mut grouped: Vec<(bool, String, Vec<String>)> = Vec::new();
+    for skipped in trace.skipped_releases {
+        if let Some(runtime_tag) = skipped.release_tag.strip_prefix("runtime selected ") {
+            lines.push(format!("{label} runtime selected release: {runtime_tag}"));
+            continue;
+        }
+
+        let (runtime, release_tag) = if let Some(tag) = skipped.release_tag.strip_prefix("runtime ")
+        {
+            (true, tag.to_string())
+        } else {
+            (false, skipped.release_tag)
+        };
+        let reason = summarize_resolution_reason(&skipped.reason);
+
+        if let Some((_, _, tags)) =
+            grouped
+                .iter_mut()
+                .find(|(existing_runtime, existing_reason, _)| {
+                    *existing_runtime == runtime && *existing_reason == reason
+                })
+        {
+            tags.push(release_tag);
+        } else {
+            grouped.push((runtime, reason, vec![release_tag]));
+        }
+    }
+
+    for (runtime, tags, reason) in grouped
+        .into_iter()
+        .map(|(runtime, reason, tags)| (runtime, tags.join(", "), reason))
+    {
+        if runtime {
+            lines.push(format!("{label} runtime skipped {tags}: {reason}"));
+        } else {
+            lines.push(format!("{label} skipped {tags}: {reason}"));
+        }
+    }
+}
+
+fn summarize_resolution_reason(reason: &str) -> String {
+    if let Some(rest) = reason.strip_prefix("No asset matching ")
+        && let Some((component, tail)) = rest.split_once(" for tried platform(s) `")
+        && let Some((tried, _)) = tail.split_once('`')
+    {
+        return format!("missing {component} asset for `{tried}`");
+    }
+
+    reason.to_string()
 }
 
 fn print_verbose_runtime(paths: &Paths, no_cache: bool, prerelease: bool) {
@@ -1015,9 +1178,10 @@ fn wrapper_version_from_asset_url(wrapper_id: &str, url: &str) -> Option<String>
 mod tests {
     use super::{
         auth_version_from_asset_url, backend_version_from_asset_url, format_version_opt,
-        parse_version_from_cli_output, standalone_version_from_asset_url,
-        wrapper_version_from_asset_url,
+        parse_version_from_cli_output, push_resolution_lines, standalone_version_from_asset_url,
+        summarize_resolution_reason, wrapper_version_from_asset_url,
     };
+    use crate::github_releases::{ResolutionSkippedRelease, ResolutionTrace};
 
     #[test]
     fn parses_versions_from_asset_urls() {
@@ -1056,5 +1220,40 @@ mod tests {
     #[test]
     fn formats_unknown_version() {
         assert_eq!(format_version_opt(None), "unknown");
+    }
+
+    #[test]
+    fn summarizes_missing_asset_resolution_reason() {
+        let reason = "No asset matching backend for tried platform(s) `x86_64-pc-windows-msvc`. Expected pattern: foo. Available assets: a, b";
+        assert_eq!(
+            summarize_resolution_reason(reason),
+            "missing backend asset for `x86_64-pc-windows-msvc`"
+        );
+    }
+
+    #[test]
+    fn groups_skipped_resolution_lines_with_same_reason() {
+        let trace = ResolutionTrace {
+            selected_release_tag: Some("v0.1.0".to_string()),
+            skipped_releases: vec![
+                ResolutionSkippedRelease {
+                    release_tag: "v0.2.0".to_string(),
+                    reason: "No asset matching backend for tried platform(s) `x86_64-pc-windows-msvc`. Expected pattern: foo. Available assets: bar".to_string(),
+                },
+                ResolutionSkippedRelease {
+                    release_tag: "v0.1.9".to_string(),
+                    reason: "No asset matching backend for tried platform(s) `x86_64-pc-windows-msvc`. Expected pattern: foo. Available assets: baz".to_string(),
+                },
+            ],
+        };
+        let mut lines = Vec::new();
+
+        push_resolution_lines(&mut lines, "backend", trace);
+
+        assert_eq!(lines[0], "backend selected release: v0.1.0");
+        assert_eq!(
+            lines[1],
+            "backend skipped v0.2.0, v0.1.9: missing backend asset for `x86_64-pc-windows-msvc`"
+        );
     }
 }

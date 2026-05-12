@@ -33,6 +33,7 @@ const WRAPPERS_EDITION_3: &[(&str, &str)] = &[
 const CHECKSUMS_ASSET_NAME: &str = "SHA256SUMS.txt";
 const RELEASE_CACHE_TTL: Duration = Duration::from_secs(15 * 60);
 const LINUX_LIBC_ENV: &str = "HACKARENA_LINUX_LIBC";
+const RELEASES_PER_PAGE: usize = 100;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LinuxLibcMode {
@@ -104,6 +105,18 @@ struct InstallableRelease<T> {
     release: GithubRelease,
     version: Version,
     value: T,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct ResolutionTrace {
+    pub selected_release_tag: Option<String>,
+    pub skipped_releases: Vec<ResolutionSkippedRelease>,
+}
+
+#[derive(Debug, Clone)]
+pub struct ResolutionSkippedRelease {
+    pub release_tag: String,
+    pub reason: String,
 }
 
 #[derive(Debug, Clone)]
@@ -286,6 +299,34 @@ pub async fn latest_auth_from_releases(
     Ok((asset.url, asset.sha256))
 }
 
+pub async fn latest_auth_from_releases_with_trace(
+    paths: &Paths,
+    edition: &str,
+    no_cache: bool,
+    prerelease: bool,
+    current_version: Option<&str>,
+    linux_libc_override: Option<LinuxLibcMode>,
+) -> Result<((String, String), ResolutionTrace), HackArenaError> {
+    let repos = repos_for_edition(edition).ok_or_else(|| {
+        HackArenaError::msg(format!(
+            "GitHub Releases mapping is not configured for edition `{edition}`"
+        ))
+    })?;
+    let target = current_target_triples(linux_libc_override)?;
+    let use_cache = !no_cache;
+    let (asset, trace) = resolve_required_component_with_trace(
+        paths,
+        repos.auth_repo,
+        ComponentSelector::Auth,
+        &target,
+        use_cache,
+        prerelease,
+        current_version,
+    )
+    .await?;
+    Ok(((asset.url, asset.sha256), trace))
+}
+
 pub async fn latest_backend_from_releases(
     paths: &Paths,
     edition: &str,
@@ -326,6 +367,46 @@ pub async fn latest_backend_from_releases(
     }))
 }
 
+pub async fn latest_backend_from_releases_with_trace(
+    paths: &Paths,
+    edition: &str,
+    no_cache: bool,
+    prerelease: bool,
+    current_version: Option<&str>,
+    linux_libc_override: Option<LinuxLibcMode>,
+) -> Result<(Option<ProjectInstalledBundle>, ResolutionTrace), HackArenaError> {
+    let repos = repos_for_edition(edition).ok_or_else(|| {
+        HackArenaError::msg(format!(
+            "GitHub Releases mapping is not configured for edition `{edition}`"
+        ))
+    })?;
+    let Some(repo) = repos.backend_repo else {
+        return Ok((None, ResolutionTrace::default()));
+    };
+    let target = current_target_triples(linux_libc_override)?;
+    let use_cache = !no_cache;
+    let (asset, trace) = resolve_optional_component_with_trace(
+        paths,
+        repo,
+        ComponentSelector::Backend,
+        &target,
+        use_cache,
+        prerelease,
+        current_version,
+    )
+    .await?;
+    Ok((
+        asset.map(|asset| ProjectInstalledBundle {
+            url: asset.url,
+            install_dir: PathBuf::from(PROJECT_BACKEND_DIR),
+            sha256: Some(asset.sha256),
+            installed_at_unix: None,
+            files: vec![],
+        }),
+        trace,
+    ))
+}
+
 pub async fn latest_standalone_from_releases(
     paths: &Paths,
     edition: &str,
@@ -364,6 +445,46 @@ pub async fn latest_standalone_from_releases(
         installed_at_unix: None,
         files: vec![],
     }))
+}
+
+pub async fn latest_standalone_from_releases_with_trace(
+    paths: &Paths,
+    edition: &str,
+    no_cache: bool,
+    prerelease: bool,
+    current_version: Option<&str>,
+    linux_libc_override: Option<LinuxLibcMode>,
+) -> Result<(Option<ProjectInstalledBundle>, ResolutionTrace), HackArenaError> {
+    let repos = repos_for_edition(edition).ok_or_else(|| {
+        HackArenaError::msg(format!(
+            "GitHub Releases mapping is not configured for edition `{edition}`"
+        ))
+    })?;
+    let Some(repo) = repos.backend_repo else {
+        return Ok((None, ResolutionTrace::default()));
+    };
+    let target = current_target_triples(linux_libc_override)?;
+    let use_cache = !no_cache;
+    let (asset, trace) = resolve_optional_component_with_trace(
+        paths,
+        repo,
+        ComponentSelector::Standalone,
+        &target,
+        use_cache,
+        prerelease,
+        current_version,
+    )
+    .await?;
+    Ok((
+        asset.map(|asset| ProjectInstalledBundle {
+            url: asset.url,
+            install_dir: PathBuf::from(PROJECT_STANDALONE_DIR),
+            sha256: Some(asset.sha256),
+            installed_at_unix: None,
+            files: vec![],
+        }),
+        trace,
+    ))
 }
 
 pub async fn latest_self_update_release_tag(
@@ -450,6 +571,57 @@ pub async fn latest_wrapper_from_releases(
         installed_at_unix: None,
         files: vec![],
     }))
+}
+
+pub async fn latest_wrapper_from_releases_with_trace(
+    paths: &Paths,
+    edition: &str,
+    wrapper_id: &str,
+    no_cache: bool,
+    prerelease: bool,
+    current_version: Option<&str>,
+    linux_libc_override: Option<LinuxLibcMode>,
+) -> Result<(Option<ProjectInstalledBundle>, ResolutionTrace), HackArenaError> {
+    let base_id = wrapper_base_id(wrapper_id);
+    let Some(repo) = wrapper_repo_for_edition(edition, base_id) else {
+        return Ok((None, ResolutionTrace::default()));
+    };
+    let target = current_target_triples(linux_libc_override)?;
+    let use_cache = !no_cache;
+    let (candidate, mut trace) = latest_installable_component_release_with_trace(
+        paths,
+        repo,
+        ComponentSelector::Wrapper(base_id),
+        &target,
+        use_cache,
+        prerelease,
+        current_version,
+    )
+    .await?;
+    if base_id.eq_ignore_ascii_case("python") {
+        let runtime_trace = latest_installable_python_wheel_release_with_trace(
+            paths,
+            repo,
+            base_id,
+            &target,
+            use_cache,
+            prerelease,
+            current_version,
+        )
+        .await?
+        .1;
+        merge_resolution_trace(&mut trace, runtime_trace, "runtime");
+    }
+    Ok((
+        candidate.map(|candidate| ProjectInstalledBundle {
+            url: candidate.value.url,
+            install_dir: PathBuf::from(PROJECT_WRAPPERS_DIR).join(wrapper_id),
+            sha256: Some(candidate.value.sha256),
+            installed_at_unix: None,
+            files: vec![],
+        }),
+        trace,
+    ))
 }
 
 pub async fn wrapper_from_release_tag(
@@ -751,6 +923,34 @@ async fn resolve_required_component(
     Ok(asset)
 }
 
+async fn resolve_required_component_with_trace(
+    paths: &Paths,
+    repo: &str,
+    component: ComponentSelector<'_>,
+    target: &TargetTripleResolution,
+    use_cache: bool,
+    allow_prerelease: bool,
+    current_version: Option<&str>,
+) -> Result<(ResolvedReleaseAsset, ResolutionTrace), HackArenaError> {
+    let (asset, trace) = resolve_optional_component_with_trace(
+        paths,
+        repo,
+        component,
+        target,
+        use_cache,
+        allow_prerelease,
+        current_version,
+    )
+    .await?;
+    let Some(asset) = asset else {
+        return Err(HackArenaError::msg(format!(
+            "No GitHub release found for {} in `{repo}`.",
+            component_name(component)
+        )));
+    };
+    Ok((asset, trace))
+}
+
 async fn resolve_optional_component(
     paths: &Paths,
     repo: &str,
@@ -771,6 +971,28 @@ async fn resolve_optional_component(
     )
     .await?
     .map(|candidate| candidate.value))
+}
+
+async fn resolve_optional_component_with_trace(
+    paths: &Paths,
+    repo: &str,
+    component: ComponentSelector<'_>,
+    target: &TargetTripleResolution,
+    use_cache: bool,
+    allow_prerelease: bool,
+    current_version: Option<&str>,
+) -> Result<(Option<ResolvedReleaseAsset>, ResolutionTrace), HackArenaError> {
+    let (candidate, trace) = latest_installable_component_release_with_trace(
+        paths,
+        repo,
+        component,
+        target,
+        use_cache,
+        allow_prerelease,
+        current_version,
+    )
+    .await?;
+    Ok((candidate.map(|candidate| candidate.value), trace))
 }
 
 async fn resolve_component_from_release(
@@ -1410,6 +1632,51 @@ async fn latest_installable_component_release(
     Ok(select_installable_release(&candidates, allow_prerelease, current_version).cloned())
 }
 
+async fn latest_installable_component_release_with_trace(
+    paths: &Paths,
+    repo: &str,
+    component: ComponentSelector<'_>,
+    target: &TargetTripleResolution,
+    use_cache: bool,
+    allow_prerelease: bool,
+    current_version: Option<&str>,
+) -> Result<
+    (
+        Option<InstallableRelease<ResolvedReleaseAsset>>,
+        ResolutionTrace,
+    ),
+    HackArenaError,
+> {
+    let releases = fetch_release_list(paths, repo, use_cache).await?;
+    let mut candidates = Vec::new();
+    let mut trace = ResolutionTrace::default();
+    for release in sorted_release_candidates(&releases) {
+        let Some(version) = parse_release_version(&release.tag_name) else {
+            continue;
+        };
+        match resolve_component_from_release(paths, repo, release, component, target, use_cache)
+            .await
+        {
+            Ok(asset) => candidates.push(InstallableRelease {
+                release: release.clone(),
+                version,
+                value: asset,
+            }),
+            Err(err) => trace.skipped_releases.push(ResolutionSkippedRelease {
+                release_tag: release.tag_name.clone(),
+                reason: err.to_string(),
+            }),
+        }
+    }
+    let selected =
+        select_installable_release(&candidates, allow_prerelease, current_version).cloned();
+    trace.selected_release_tag = selected
+        .as_ref()
+        .map(|candidate| candidate.release.tag_name.clone());
+    prune_skipped_trace(&mut trace, selected.as_ref());
+    Ok((selected, trace))
+}
+
 async fn latest_installable_python_wheel_release(
     paths: &Paths,
     repo: &str,
@@ -1438,6 +1705,45 @@ async fn latest_installable_python_wheel_release(
         }
     }
     Ok(select_installable_release(&candidates, allow_prerelease, current_version).cloned())
+}
+
+async fn latest_installable_python_wheel_release_with_trace(
+    paths: &Paths,
+    repo: &str,
+    wrapper_id: &str,
+    target: &TargetTripleResolution,
+    use_cache: bool,
+    allow_prerelease: bool,
+    current_version: Option<&str>,
+) -> Result<(Option<InstallableRelease<ArtifactSpec>>, ResolutionTrace), HackArenaError> {
+    let releases = fetch_release_list(paths, repo, use_cache).await?;
+    let mut candidates = Vec::new();
+    let mut trace = ResolutionTrace::default();
+    for release in sorted_release_candidates(&releases) {
+        let Some(version) = parse_release_version(&release.tag_name) else {
+            continue;
+        };
+        match resolve_python_wheel_from_release(paths, repo, wrapper_id, target, release, use_cache)
+            .await
+        {
+            Ok(asset) => candidates.push(InstallableRelease {
+                release: release.clone(),
+                version,
+                value: asset,
+            }),
+            Err(err) => trace.skipped_releases.push(ResolutionSkippedRelease {
+                release_tag: release.tag_name.clone(),
+                reason: err.to_string(),
+            }),
+        }
+    }
+    let selected =
+        select_installable_release(&candidates, allow_prerelease, current_version).cloned();
+    trace.selected_release_tag = selected
+        .as_ref()
+        .map(|candidate| candidate.release.tag_name.clone());
+    prune_skipped_trace(&mut trace, selected.as_ref());
+    Ok((selected, trace))
 }
 
 async fn latest_installable_csharp_nupkg_release(
@@ -1550,12 +1856,49 @@ async fn fetch_release_list(
     let cache_dir = cache_dir_for_repo(paths, repo);
     let data_path = cache_dir.join("release_list.json");
     let meta_path = cache_dir.join("release_list.meta.json");
-    let url = format!("https://api.github.com/repos/{repo}/releases?per_page=20");
-    Ok(
-        fetch_cached_json_resource(paths, &url, use_cache, &data_path, &meta_path, false)
-            .await?
-            .unwrap_or_default(),
-    )
+    let cached = if use_cache {
+        read_cached_json::<Vec<GithubRelease>>(&data_path, &meta_path)?
+    } else {
+        None
+    };
+    if let Some((value, meta)) = &cached
+        && cache_meta_is_fresh(meta, RELEASE_CACHE_TTL)
+    {
+        return Ok(value.clone());
+    }
+
+    let client = reqwest::Client::new();
+    let mut page = 1usize;
+    let mut releases = Vec::<GithubRelease>::new();
+    loop {
+        let url = format!(
+            "https://api.github.com/repos/{repo}/releases?per_page={RELEASES_PER_PAGE}&page={page}"
+        );
+        let page_items =
+            fetch_uncached_json_resource::<Vec<GithubRelease>>(paths, &client, &url, false).await?;
+        let page_items = page_items.unwrap_or_default();
+        let fetched_count = page_items.len();
+        if fetched_count == 0 {
+            break;
+        }
+        releases.extend(page_items);
+        if fetched_count < RELEASES_PER_PAGE {
+            break;
+        }
+        page += 1;
+    }
+
+    write_cached_bytes(
+        &data_path,
+        &meta_path,
+        &serde_json::to_vec(&releases)
+            .map_err(|e| HackArenaError::json_with_path(&data_path, e))?,
+        GithubCacheMeta {
+            etag: None,
+            fetched_at_unix: now_unix_secs()?,
+        },
+    )?;
+    Ok(releases)
 }
 
 async fn fetch_cached_json_resource<T: for<'de> Deserialize<'de> + Clone>(
@@ -1620,6 +1963,62 @@ async fn fetch_cached_json_resource<T: for<'de> Deserialize<'de> + Clone>(
                 }
                 return Err(HackArenaError::msg(format!(
                     "GitHub returned 304 for `{url}` but no cached metadata was available."
+                )));
+            }
+            Ok(GithubGetOutcome::NotFound) => return Ok(None),
+            Ok(GithubGetOutcome::RateLimited(info)) => {
+                last_rate_limit_status = Some(info.status_code);
+                if attempt + 1 < max_attempts {
+                    tokio::time::sleep(backoff_delay_for_attempt(&info, attempt)).await;
+                    continue;
+                }
+                return Err(github_http::rate_limit_error(
+                    url,
+                    last_rate_limit_status.unwrap_or(403),
+                ));
+            }
+            Err(err) => return Err(err),
+        }
+    }
+
+    Err(github_http::rate_limit_error(
+        url,
+        last_rate_limit_status.unwrap_or(403),
+    ))
+}
+
+async fn fetch_uncached_json_resource<T: for<'de> Deserialize<'de>>(
+    paths: &Paths,
+    client: &reqwest::Client,
+    url: &str,
+    allow_not_found: bool,
+) -> Result<Option<T>, HackArenaError> {
+    let mut last_rate_limit_status: Option<u16> = None;
+    let max_attempts = 3;
+
+    for attempt in 0..max_attempts {
+        match github_http::get(
+            paths,
+            client,
+            url,
+            GITHUB_JSON_ACCEPT,
+            None,
+            allow_not_found,
+        )
+        .await
+        {
+            Ok(GithubGetOutcome::Response(resp)) => {
+                let bytes = resp
+                    .bytes()
+                    .await
+                    .map_err(|e| HackArenaError::http_with_url(url, e))?;
+                let parsed = serde_json::from_slice::<T>(&bytes)
+                    .map_err(|e| HackArenaError::json_with_url(url, e))?;
+                return Ok(Some(parsed));
+            }
+            Ok(GithubGetOutcome::NotModified) => {
+                return Err(HackArenaError::msg(format!(
+                    "GitHub returned 304 for `{url}` during uncached fetch."
                 )));
             }
             Ok(GithubGetOutcome::NotFound) => return Ok(None),
@@ -1812,6 +2211,35 @@ fn cache_dir_for_repo(paths: &Paths, repo: &str) -> PathBuf {
     hasher.update(repo.as_bytes());
     let key = hex::encode(hasher.finalize());
     paths.releases_cache_dir().join(key)
+}
+
+fn prune_skipped_trace<T>(trace: &mut ResolutionTrace, selected: Option<&InstallableRelease<T>>) {
+    let Some(selected) = selected else {
+        return;
+    };
+    trace.skipped_releases.retain(|skip| {
+        parse_release_version(&skip.release_tag).is_some_and(|version| version > selected.version)
+    });
+}
+
+fn merge_resolution_trace(target: &mut ResolutionTrace, source: ResolutionTrace, prefix: &str) {
+    if let Some(selected) = source.selected_release_tag {
+        target.skipped_releases.push(ResolutionSkippedRelease {
+            release_tag: format!("{prefix} selected {selected}"),
+            reason: String::new(),
+        });
+    }
+    target
+        .skipped_releases
+        .extend(
+            source
+                .skipped_releases
+                .into_iter()
+                .map(|skip| ResolutionSkippedRelease {
+                    release_tag: format!("{prefix} {}", skip.release_tag),
+                    reason: skip.reason,
+                }),
+        );
 }
 
 fn cache_dir_for_repo_tag(paths: &Paths, repo: &str, release_tag: &str) -> PathBuf {
@@ -2750,12 +3178,13 @@ fn strip_known_triple_suffix(value: &str) -> &str {
 mod tests {
     use super::{
         ComponentSelector, GithubAsset, GithubRelease, InstallableRelease, LinuxLibcMode,
-        TargetTripleResolution, cpp_sdk_asset_candidates, experimental_wrapper_ids_for_edition,
+        ResolutionSkippedRelease, ResolutionTrace, TargetTripleResolution,
+        cpp_sdk_asset_candidates, experimental_wrapper_ids_for_edition,
         extract_wrapper_version_from_asset_name, has_wrapper_repo, is_component_asset,
-        is_experimental_wrapper, linux_target_triples_for_arch, normalize_release_version,
-        parse_release_version, parse_sha256_sums, resolve_cpp_sdk_asset,
-        resolve_linux_mode_from_inputs, resolve_typescript_runtime_tgz_asset,
-        select_component_asset, select_installable_release,
+        is_experimental_wrapper, linux_target_triples_for_arch, merge_resolution_trace,
+        normalize_release_version, parse_release_version, parse_sha256_sums, prune_skipped_trace,
+        resolve_cpp_sdk_asset, resolve_linux_mode_from_inputs,
+        resolve_typescript_runtime_tgz_asset, select_component_asset, select_installable_release,
         try_resolve_component_from_release_with_checksums,
         try_resolve_typescript_runtime_tgz_asset, wrapper_base_id, wrapper_ids_for_edition,
     };
@@ -2787,6 +3216,13 @@ mod tests {
             },
             version: parse_release_version(tag).expect("version"),
             value: (),
+        }
+    }
+
+    fn skipped(tag: &str, reason: &str) -> ResolutionSkippedRelease {
+        ResolutionSkippedRelease {
+            release_tag: tag.to_string(),
+            reason: reason.to_string(),
         }
     }
 
@@ -3312,6 +3748,41 @@ bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb *ha3-backend-lo
         let selected = select_installable_release(&candidates, true, Some("0.2.0"))
             .expect("prerelease candidate");
         assert_eq!(selected.release.tag_name, "v0.3.0-beta.1");
+    }
+
+    #[test]
+    fn prune_skipped_trace_keeps_only_newer_candidates_than_selected_release() {
+        let selected = candidate("v0.1.2");
+        let mut trace = ResolutionTrace {
+            selected_release_tag: Some("v0.1.2".to_string()),
+            skipped_releases: vec![
+                skipped("v0.2.0b1", "missing checksum"),
+                skipped("v0.1.1", "older"),
+            ],
+        };
+
+        prune_skipped_trace(&mut trace, Some(&selected));
+
+        assert_eq!(trace.skipped_releases.len(), 1);
+        assert_eq!(trace.skipped_releases[0].release_tag, "v0.2.0b1");
+    }
+
+    #[test]
+    fn merge_resolution_trace_prefixes_runtime_entries() {
+        let mut target = ResolutionTrace::default();
+        let source = ResolutionTrace {
+            selected_release_tag: Some("v0.1.2".to_string()),
+            skipped_releases: vec![skipped("v0.2.0b1", "missing wheel checksum")],
+        };
+
+        merge_resolution_trace(&mut target, source, "runtime");
+
+        assert_eq!(
+            target.skipped_releases[0].release_tag,
+            "runtime selected v0.1.2"
+        );
+        assert_eq!(target.skipped_releases[1].release_tag, "runtime v0.2.0b1");
+        assert_eq!(target.skipped_releases[1].reason, "missing wheel checksum");
     }
 
     #[test]
