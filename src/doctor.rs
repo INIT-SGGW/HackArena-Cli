@@ -369,24 +369,36 @@ pub async fn status(
         println!();
     }
 
+    println!("CLI");
     match self_update::cli_update_state(paths, no_cache, prerelease).await {
         CliUpdateState::UpToDate { current_version } => {
-            println!("cli: up to date ({})", format_version(&current_version));
+            print_status_line(
+                "cli",
+                "up to date",
+                Some(format!("({})", format_version(&current_version))),
+            );
         }
         CliUpdateState::UpdateAvailable {
             current_version,
             target_version,
             ..
         } => {
-            println!(
-                "cli: update available ({} -> {})",
-                format_version(&current_version),
-                format_version(&target_version)
+            print_status_line(
+                "cli",
+                "update available",
+                Some(format!(
+                    "({} -> {})",
+                    format_version(&current_version),
+                    format_version(&target_version)
+                )),
             );
         }
-        CliUpdateState::Unknown { .. } => println!("cli: unknown (cannot check latest)"),
-        CliUpdateState::NoRelease { .. } => println!("cli: no release yet"),
+        CliUpdateState::Unknown { .. } => {
+            print_status_line("cli", "unknown (cannot check latest)", None)
+        }
+        CliUpdateState::NoRelease { .. } => print_status_line("cli", "no release yet", None),
     }
+    println!();
 
     let project_manifest = match load_project_manifest(workspace_root) {
         Ok(m) => Some(m),
@@ -394,6 +406,7 @@ pub async fn status(
     };
 
     // auth (global)
+    println!("Global");
     let auth_path = paths.bin_dir.join(if cfg!(windows) {
         "ha-auth.exe"
     } else {
@@ -420,29 +433,39 @@ pub async fn status(
         .ok()
         .and_then(|(url, _)| auth_version_from_asset_url(url));
     match (current_auth_sha.as_deref(), latest_auth) {
-        (None, _) => println!("auth: unknown"),
-        (Some(_), Err(_)) => println!("auth: unknown (cannot check latest)"),
+        (None, _) => print_status_line("auth", "unknown", None),
+        (Some(_), Err(_)) => print_status_line("auth", "unknown (cannot check latest)", None),
         (Some(current), Ok((_url, latest_sha))) => {
             if current.eq_ignore_ascii_case(&latest_sha) {
                 if let Some(version) = current_auth_version
                     .as_deref()
                     .or(latest_auth_version.as_deref())
                 {
-                    println!("auth: up to date ({})", format_version(version));
+                    print_status_line(
+                        "auth",
+                        "up to date",
+                        Some(format!("({})", format_version(version))),
+                    );
                 } else {
-                    println!("auth: up to date");
+                    print_status_line("auth", "up to date", None);
                 }
             } else {
-                println!(
-                    "auth: update available ({} -> {})",
-                    format_version_opt(current_auth_version.as_deref()),
-                    format_version_opt(latest_auth_version.as_deref())
+                print_status_line(
+                    "auth",
+                    "update available",
+                    Some(format!(
+                        "({} -> {})",
+                        format_version_opt(current_auth_version.as_deref()),
+                        format_version_opt(latest_auth_version.as_deref())
+                    )),
                 );
             }
         }
     }
+    println!();
 
     // backend (project-local)
+    println!("Project");
     let current_backend = project_manifest.as_ref().and_then(|m| m.backend.as_ref());
     let current_backend_version =
         current_backend.and_then(|b| backend_version_from_asset_url(&b.url));
@@ -461,16 +484,16 @@ pub async fn status(
         .and_then(|b| b.as_ref())
         .and_then(|b| backend_version_from_asset_url(&b.url));
     match (current_backend, latest_backend) {
-        (_, Err(_)) => println!("backend: unknown (cannot check latest)"),
+        (_, Err(_)) => print_status_line("backend", "unknown (cannot check latest)", None),
         (None, Ok(None)) if github_releases::has_backend_repo(&project.edition) => {
-            println!("backend: no release yet")
+            print_status_line("backend", "no release yet", None)
         }
-        (None, Ok(None)) => println!("backend: n/a (not configured)"),
-        (None, Ok(Some(_))) => println!("backend: not installed"),
+        (None, Ok(None)) => print_status_line("backend", "n/a (not configured)", None),
+        (None, Ok(Some(_))) => print_status_line("backend", "not installed", None),
         (Some(_), Ok(None)) if github_releases::has_backend_repo(&project.edition) => {
-            println!("backend: installed, but no release available now")
+            print_status_line("backend", "installed, but no release available now", None)
         }
-        (Some(_), Ok(None)) => println!("backend: n/a (not configured)"),
+        (Some(_), Ok(None)) => print_status_line("backend", "n/a (not configured)", None),
         (Some(current), Ok(Some(latest))) => {
             let current_sha = current.sha256.as_deref();
             let latest_sha = latest.sha256.as_deref();
@@ -479,15 +502,23 @@ pub async fn status(
                     .as_deref()
                     .or(latest_backend_version.as_deref())
                 {
-                    println!("backend: up to date ({})", format_version(version));
+                    print_status_line(
+                        "backend",
+                        "up to date",
+                        Some(format!("({})", format_version(version))),
+                    );
                 } else {
-                    println!("backend: up to date");
+                    print_status_line("backend", "up to date", None);
                 }
             } else {
-                println!(
-                    "backend: update available ({} -> {})",
-                    format_version_opt(current_backend_version.as_deref()),
-                    format_version_opt(latest_backend_version.as_deref())
+                print_status_line(
+                    "backend",
+                    "update available",
+                    Some(format!(
+                        "({} -> {})",
+                        format_version_opt(current_backend_version.as_deref()),
+                        format_version_opt(latest_backend_version.as_deref())
+                    )),
                 );
             }
         }
@@ -502,17 +533,29 @@ pub async fn status(
         .is_some_and(|bundle| bundle.install_dir == PathBuf::from(PROJECT_STANDALONE_DIR));
     if !standalone_tracked && standalone_dir.exists() {
         if let Some(issue) = standalone_install_layout_issue(&standalone_dir) {
-            println!("standalone: invalid layout on disk, not tracked in manifest: {issue}");
+            print_status_line(
+                "standalone",
+                &format!("invalid layout on disk, not tracked in manifest: {issue}"),
+                None,
+            );
         } else {
-            println!("standalone: installed on disk, not tracked in manifest");
+            print_status_line(
+                "standalone",
+                "installed on disk, not tracked in manifest",
+                None,
+            );
         }
     } else if standalone_tracked && !standalone_dir.exists() {
-        println!("standalone: not installed");
+        print_status_line("standalone", "not installed", None);
     } else if standalone_tracked
         && standalone_dir.exists()
         && let Some(issue) = standalone_install_layout_issue(&standalone_dir)
     {
-        println!("standalone: invalid layout on disk: {issue}");
+        print_status_line(
+            "standalone",
+            &format!("invalid layout on disk: {issue}"),
+            None,
+        );
     } else {
         let current_standalone_version =
             current_standalone.and_then(|bundle| standalone_version_from_asset_url(&bundle.url));
@@ -531,10 +574,14 @@ pub async fn status(
             .and_then(|bundle| bundle.as_ref())
             .and_then(|bundle| standalone_version_from_asset_url(&bundle.url));
         match (current_standalone, latest_standalone) {
-            (_, Err(_)) => println!("standalone: unknown (cannot check latest)"),
-            (None, Ok(None)) => println!("standalone: not installed"),
-            (None, Ok(Some(_))) => println!("standalone: not installed"),
-            (Some(_), Ok(None)) => println!("standalone: installed, but no release available now"),
+            (_, Err(_)) => print_status_line("standalone", "unknown (cannot check latest)", None),
+            (None, Ok(None)) => print_status_line("standalone", "not installed", None),
+            (None, Ok(Some(_))) => print_status_line("standalone", "not installed", None),
+            (Some(_), Ok(None)) => print_status_line(
+                "standalone",
+                "installed, but no release available now",
+                None,
+            ),
             (Some(current), Ok(Some(latest))) => {
                 let current_sha = current.sha256.as_deref();
                 let latest_sha = latest.sha256.as_deref();
@@ -543,22 +590,32 @@ pub async fn status(
                         .as_deref()
                         .or(latest_standalone_version.as_deref())
                     {
-                        println!("standalone: up to date ({})", format_version(version));
+                        print_status_line(
+                            "standalone",
+                            "up to date",
+                            Some(format!("({})", format_version(version))),
+                        );
                     } else {
-                        println!("standalone: up to date");
+                        print_status_line("standalone", "up to date", None);
                     }
                 } else {
-                    println!(
-                        "standalone: update available ({} -> {})",
-                        format_version_opt(current_standalone_version.as_deref()),
-                        format_version_opt(latest_standalone_version.as_deref())
+                    print_status_line(
+                        "standalone",
+                        "update available",
+                        Some(format!(
+                            "({} -> {})",
+                            format_version_opt(current_standalone_version.as_deref()),
+                            format_version_opt(latest_standalone_version.as_deref())
+                        )),
                     );
                 }
             }
         }
     }
+    println!();
 
     // wrapper (project-local, optional)
+    println!("Wrappers");
     let installed_wrappers = project_manifest
         .as_ref()
         .map(|m| m.wrappers.clone())
@@ -572,7 +629,7 @@ pub async fn status(
         && installed_wrappers.is_empty()
         && untracked_wrappers.is_empty()
     {
-        println!("wrapper: n/a (no wrappers configured)");
+        print_status_line("wrappers", "n/a (no wrappers configured)", None);
         return Ok(());
     }
 
@@ -605,29 +662,33 @@ pub async fn status(
             Err(_) => {
                 if instances.is_empty() {
                     if untracked_instances.is_empty() {
-                        println!("wrapper/{wrapper_id}: unknown (cannot check latest)");
+                        print_status_line(wrapper_id, "unknown (cannot check latest)", None);
                     }
                 } else {
                     for (instance_id, _current) in &instances {
-                        println!("wrapper/{instance_id}: unknown (cannot check latest)");
+                        print_status_line(instance_id, "unknown (cannot check latest)", None);
                     }
                 }
             }
             Ok(None) => {
                 if instances.is_empty() {
                     if untracked_instances.is_empty() {
-                        println!("wrapper/{wrapper_id}: no release yet");
+                        print_status_line(wrapper_id, "no release yet", None);
                     }
                 } else {
                     for (instance_id, _current) in &instances {
-                        println!("wrapper/{instance_id}: installed, but no release available now");
+                        print_status_line(
+                            instance_id,
+                            "installed, but no release available now",
+                            None,
+                        );
                     }
                 }
             }
             Ok(Some(latest_bundle)) => {
                 if instances.is_empty() {
                     if untracked_instances.is_empty() {
-                        println!("wrapper/{wrapper_id}: not installed");
+                        print_status_line(wrapper_id, "not installed", None);
                     }
                     continue;
                 }
@@ -641,18 +702,23 @@ pub async fn status(
                             .as_deref()
                             .or(latest_wrapper_version.as_deref())
                         {
-                            println!(
-                                "wrapper/{instance_id}: up to date ({})",
-                                format_version(version)
+                            print_status_line(
+                                instance_id,
+                                "up to date",
+                                Some(format!("({})", format_version(version))),
                             );
                         } else {
-                            println!("wrapper/{instance_id}: up to date");
+                            print_status_line(instance_id, "up to date", None);
                         }
                     } else {
-                        println!(
-                            "wrapper/{instance_id}: update available ({} -> {})",
-                            format_version_opt(current_wrapper_version.as_deref()),
-                            format_version_opt(latest_wrapper_version.as_deref())
+                        print_status_line(
+                            instance_id,
+                            "update available",
+                            Some(format!(
+                                "({} -> {})",
+                                format_version_opt(current_wrapper_version.as_deref()),
+                                format_version_opt(latest_wrapper_version.as_deref())
+                            )),
                         );
                     }
                 }
@@ -688,9 +754,15 @@ pub async fn status(
                 )
             });
         match latest {
-            Err(_) => println!("wrapper/{wrapper_id}: experimental, unknown (cannot check latest)"),
-            Ok(None) => println!(
-                "wrapper/{wrapper_id}: experimental, installed but no release available now"
+            Err(_) => print_status_line(
+                wrapper_id,
+                "experimental, unknown (cannot check latest)",
+                None,
+            ),
+            Ok(None) => print_status_line(
+                wrapper_id,
+                "experimental, installed but no release available now",
+                None,
             ),
             Ok(Some(latest_bundle)) => {
                 let current_sha = current.sha256.as_deref();
@@ -700,18 +772,23 @@ pub async fn status(
                         .as_deref()
                         .or(latest_wrapper_version.as_deref())
                     {
-                        println!(
-                            "wrapper/{wrapper_id}: experimental, up to date ({})",
-                            format_version(version)
+                        print_status_line(
+                            wrapper_id,
+                            "experimental, up to date",
+                            Some(format!("({})", format_version(version))),
                         );
                     } else {
-                        println!("wrapper/{wrapper_id}: experimental, up to date");
+                        print_status_line(wrapper_id, "experimental, up to date", None);
                     }
                 } else {
-                    println!(
-                        "wrapper/{wrapper_id}: experimental, update available ({} -> {})",
-                        format_version_opt(current_wrapper_version.as_deref()),
-                        format_version_opt(latest_wrapper_version.as_deref())
+                    print_status_line(
+                        wrapper_id,
+                        "experimental, update available",
+                        Some(format!(
+                            "({} -> {})",
+                            format_version_opt(current_wrapper_version.as_deref()),
+                            format_version_opt(latest_wrapper_version.as_deref())
+                        )),
                     );
                 }
             }
@@ -720,7 +797,11 @@ pub async fn status(
 
     for (wrapper_id, _current) in installed_wrappers {
         if !github_releases::has_wrapper_repo(&project.edition, &wrapper_id) {
-            println!("wrapper/{wrapper_id}: installed (not configured for this edition)");
+            print_status_line(
+                &wrapper_id,
+                "installed (not configured for this edition)",
+                None,
+            );
         }
     }
 
@@ -744,9 +825,13 @@ fn print_untracked_wrapper_status(entry: &WrapperDiskEntry) {
             } else {
                 "; not configured for this edition"
             };
-            println!(
-                "wrapper/{}: {}invalid layout on disk, not tracked in manifest: {}{}",
-                entry.id, experimental_prefix, issue, suffix
+            print_status_line(
+                &entry.id,
+                &format!(
+                    "{}invalid layout on disk, not tracked in manifest: {}{}",
+                    experimental_prefix, issue, suffix
+                ),
+                None,
             );
         }
         None => {
@@ -755,11 +840,51 @@ fn print_untracked_wrapper_status(entry: &WrapperDiskEntry) {
             } else {
                 "; not configured for this edition"
             };
-            println!(
-                "wrapper/{}: {}installed on disk, not tracked in manifest{}",
-                entry.id, experimental_prefix, suffix
+            print_status_line(
+                &entry.id,
+                &format!(
+                    "{}installed on disk, not tracked in manifest{}",
+                    experimental_prefix, suffix
+                ),
+                None,
             );
         }
+    }
+}
+
+fn print_status_line(label: &str, status: &str, detail: Option<String>) {
+    let rendered_status = render_status_phrase(status);
+    match detail {
+        Some(detail) => println!("{label}: {rendered_status} {detail}"),
+        None => println!("{label}: {rendered_status}"),
+    }
+}
+
+fn render_status_phrase(status: &str) -> String {
+    if !std::io::stdout().is_terminal() {
+        return status.to_string();
+    }
+
+    if let Some(rest) = status.strip_prefix("experimental, ") {
+        return format!("{}, {}", "experimental".blue(), render_status_body(rest));
+    }
+
+    render_status_body(status)
+}
+
+fn render_status_body(status: &str) -> String {
+    let lower = status.to_ascii_lowercase();
+    if lower.contains("up to date") {
+        status.green().to_string()
+    } else if lower.contains("update available")
+        || lower.contains("unknown")
+        || lower.contains("invalid")
+        || lower.contains("not tracked")
+        || lower.contains("no release")
+    {
+        status.yellow().to_string()
+    } else {
+        status.to_string()
     }
 }
 
