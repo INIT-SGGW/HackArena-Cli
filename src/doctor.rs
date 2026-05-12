@@ -11,6 +11,7 @@ use crate::github_releases;
 use crate::install::{
     discover_installed_wrappers, standalone_install_layout_issue, wrapper_install_layout_issue,
 };
+use crate::self_update::{self, CliUpdateState};
 use owo_colors::OwoColorize;
 use std::collections::BTreeSet;
 use std::io::IsTerminal;
@@ -81,6 +82,14 @@ pub async fn doctor(
     println!("Environment");
     println!("Artifact source: GitHub Releases");
     print_github_auth_status(paths)?;
+    if let CliUpdateState::UpdateAvailable { .. } =
+        self_update::cli_update_state(paths, no_cache, prerelease).await
+    {
+        print_action(&format!(
+            "a newer HackArena CLI version is available; run `{}`",
+            cmd_hint::run_cli("self-update")
+        ));
+    }
     if verbose {
         print_verbose_runtime(paths, no_cache, prerelease);
     }
@@ -358,6 +367,25 @@ pub async fn status(
         println!("Project dir: {}", workspace_root.display());
         print_verbose_runtime(paths, no_cache, prerelease);
         println!();
+    }
+
+    match self_update::cli_update_state(paths, no_cache, prerelease).await {
+        CliUpdateState::UpToDate { current_version } => {
+            println!("cli: up to date ({})", format_version(&current_version));
+        }
+        CliUpdateState::UpdateAvailable {
+            current_version,
+            target_version,
+            ..
+        } => {
+            println!(
+                "cli: update available ({} -> {})",
+                format_version(&current_version),
+                format_version(&target_version)
+            );
+        }
+        CliUpdateState::Unknown { .. } => println!("cli: unknown (cannot check latest)"),
+        CliUpdateState::NoRelease { .. } => println!("cli: no release yet"),
     }
 
     let project_manifest = match load_project_manifest(workspace_root) {

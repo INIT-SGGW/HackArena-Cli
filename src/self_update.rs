@@ -20,6 +20,24 @@ const SESSION_TTL: Duration = Duration::from_secs(5 * 60);
 const FILE_RELEASE_TIMEOUT: Duration = Duration::from_secs(30);
 const FILE_RELEASE_POLL_INTERVAL: Duration = Duration::from_millis(200);
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum CliUpdateState {
+    UpToDate {
+        current_version: String,
+    },
+    UpdateAvailable {
+        current_version: String,
+        target_version: String,
+        target_tag: String,
+    },
+    Unknown {
+        current_version: String,
+    },
+    NoRelease {
+        current_version: String,
+    },
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct SelfUpdateSession {
     token: String,
@@ -30,6 +48,45 @@ struct SelfUpdateSession {
     current_binary: PathBuf,
     staged_binary: PathBuf,
     backup_binary: PathBuf,
+}
+
+pub(crate) async fn cli_update_state(
+    paths: &Paths,
+    no_cache: bool,
+    prerelease: bool,
+) -> CliUpdateState {
+    let current_version = env!("CARGO_PKG_VERSION").to_string();
+    let Some(current_parsed) = github_releases::parse_release_version(&current_version) else {
+        return CliUpdateState::Unknown { current_version };
+    };
+
+    let target_tag = match github_releases::latest_self_update_release_tag(
+        paths,
+        no_cache,
+        prerelease,
+        Some(&current_version),
+    )
+    .await
+    {
+        Ok(Some(tag)) => tag,
+        Ok(None) => return CliUpdateState::NoRelease { current_version },
+        Err(_) => return CliUpdateState::Unknown { current_version },
+    };
+
+    let Some(target_parsed) = github_releases::parse_release_version(&target_tag) else {
+        return CliUpdateState::Unknown { current_version };
+    };
+    let target_version = target_parsed.to_string();
+
+    if target_parsed > current_parsed {
+        CliUpdateState::UpdateAvailable {
+            current_version,
+            target_version,
+            target_tag,
+        }
+    } else {
+        CliUpdateState::UpToDate { current_version }
+    }
 }
 
 pub async fn self_update(
@@ -151,6 +208,73 @@ pub async fn self_update(
 
     println!("Updater launched. This process will now exit.");
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::CliUpdateState;
+    use semver::Version;
+
+    fn classify(current_version: &str, target_tag: Option<&str>) -> CliUpdateState {
+        let current_parsed = Version::parse(current_version).expect("current version");
+        match target_tag {
+            None => CliUpdateState::NoRelease {
+                current_version: current_version.to_string(),
+            },
+            Some(tag) => {
+                let target_parsed =
+                    Version::parse(tag.trim_start_matches('v')).expect("target tag");
+                let target_version = target_parsed.to_string();
+                if target_parsed > current_parsed {
+                    CliUpdateState::UpdateAvailable {
+                        current_version: current_version.to_string(),
+                        target_version,
+                        target_tag: tag.to_string(),
+                    }
+                } else {
+                    CliUpdateState::UpToDate {
+                        current_version: current_version.to_string(),
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn cli_update_state_reports_newer_stable_as_update_available() {
+        assert!(matches!(
+            classify("0.2.0", Some("v0.2.1")),
+            CliUpdateState::UpdateAvailable { .. }
+        ));
+    }
+
+    #[test]
+    fn cli_update_state_reports_newer_prerelease_as_update_available() {
+        assert!(matches!(
+            classify("0.2.0-beta.2", Some("v0.2.0-beta.3")),
+            CliUpdateState::UpdateAvailable { .. }
+        ));
+    }
+
+    #[test]
+    fn cli_update_state_keeps_stable_up_to_date_when_only_older_or_equal_target_exists() {
+        assert!(matches!(
+            classify("0.2.0", Some("v0.2.0")),
+            CliUpdateState::UpToDate { .. }
+        ));
+        assert!(matches!(
+            classify("0.2.0", Some("v0.1.9")),
+            CliUpdateState::UpToDate { .. }
+        ));
+    }
+
+    #[test]
+    fn cli_update_state_reports_no_release() {
+        assert!(matches!(
+            classify("0.2.0", None),
+            CliUpdateState::NoRelease { .. }
+        ));
+    }
 }
 
 pub fn is_internal_updater_invocation(args: &[OsString]) -> bool {
